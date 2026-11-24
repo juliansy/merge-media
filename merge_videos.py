@@ -161,7 +161,11 @@ class Probe:
     sub_codec: str
     cover_codec: str
     stream_count: int
-    cover_index: int = 0
+    # 绝对流号（ffprobe streams 数组下标），-map 0:<idx> 直接用它。
+    # 正片 = 第一条非 attached_pic 的视频流；封面 = 每条 attached_pic 视频流。
+    # 不能假设“正片永远是 0:v:0、封面永远是 0:v:1”：第三方 muxer 可以换轨道顺序。
+    main_video_index: int = 0
+    cover_indices: tuple[int, ...] = ()
     sub_duration: float = 0.0          # 字幕轨自身的时长，0 表示"有轨但没内容"
 
     @property
@@ -195,12 +199,13 @@ def probe(tools: Tools, path: Path) -> Probe:
     def attached(stream: dict) -> bool:
         return int((stream.get("disposition") or {}).get("attached_pic") or 0) == 1
 
-    videos = [s for s in streams if kind(s) == "video" and not attached(s)]
+    video_streams = [(index, stream) for index, stream in enumerate(streams) if kind(stream) == "video"]
+    videos = [stream for _, stream in video_streams if not attached(stream)]
     audios = [s for s in streams if kind(s) == "audio"]
     subs = [s for s in streams if kind(s) == "subtitle"]
-    covers = [s for s in streams if kind(s) == "video" and attached(s)]
-    video_streams = [s for s in streams if kind(s) == "video"]
-    cover_index = next((i for i, s in enumerate(video_streams) if attached(s)), 0)
+    covers = [stream for _, stream in video_streams if attached(stream)]
+    main_video_index = next((index for index, stream in video_streams if not attached(stream)), 0)
+    cover_indices = tuple(index for index, stream in video_streams if attached(stream))
 
     try:
         duration = float(fmt.get("duration") or 0.0)
@@ -229,7 +234,8 @@ def probe(tools: Tools, path: Path) -> Probe:
         sub_codec=codec(subs[0] if subs else None),
         cover_codec=codec(covers[0] if covers else None),
         stream_count=len(streams),
-        cover_index=cover_index,
+        main_video_index=main_video_index,
+        cover_indices=cover_indices,
         sub_duration=stream_duration(subs[0] if subs else None),
     )
 
@@ -647,7 +653,9 @@ def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
     """组织 ffmpeg 参数。
 
     关键点：视频里**已有**的音轨 / 字幕 / 封面必须显式保留，否则只 map 新加的
-    那一路会把它们丢掉。输出视频流顺序固定为 [正片, 封面]，因此封面永远是 v:1。
+    那一路会把它们丢掉。视频流一律用绝对流号（0:<idx>）定位：正片 = 第一条非
+    attached_pic 的视频流，封面 = 每条 attached_pic 的视频流——不假设它们是
+    v:0 / v:1（第三方 muxer 可以换轨道顺序）。输出顺序固定为 [正片, 封面...]。
     """
     pr = plan.probe
     inputs: list[tuple[Path, str]] = [(plan.video, "video")]
@@ -667,9 +675,9 @@ def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
     for path, _ in inputs:
         cmd += ["-i", str(path)]
 
-    cmd += ["-map", "0:v:0"]                       # 正片
-    if pr.has_cover:
-        cmd += ["-map", f"0:v:{pr.cover_index}"]   # 原封面（按探测到的下标取，不假定 v:1）
+    cmd += ["-map", f"0:{pr.main_video_index}"]     # 正片：第一条非 attached_pic 的视频流
+    for cover_index in pr.cover_indices:            # 原封面：可能不止一条，逐条按绝对下标 map
+        cmd += ["-map", f"0:{cover_index}"]
     if pr.audio_count:
         cmd += ["-map", "0:a"]                     # 原有全部音轨
     if pr.sub_count:
@@ -693,8 +701,10 @@ def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
             except OSError:
                 language = "und"
         cmd += ["-metadata:s:s:%d" % pr.sub_count, f"language={language}"]
-    if pr.has_cover or cover:
-        cmd += ["-disposition:v:1", "attached_pic"]
+    # 输出视频流 [正片, 封面...]：正片固定 v:0，封面从 v:1 开始逐条打 attached_pic。
+    cover_outputs = len(pr.cover_indices) + (1 if cover else 0)
+    for offset in range(cover_outputs):
+        cmd += [f"-disposition:v:{offset + 1}", "attached_pic"]
     cmd += ["-map_metadata", "0", "-movflags", "+faststart",
             "-max_muxing_queue_size", "1024"]   # 大文件 remux 的 interleave 缓冲
     if with_title:
