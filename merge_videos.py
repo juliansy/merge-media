@@ -331,17 +331,57 @@ def clean_cue_text(value: object) -> str:
     return " ".join(_CONTROL_RE.sub(" ", text).split())
 
 
-def decode_text(raw: bytes) -> str:
-    """按 UTF-8 → GB18030 顺序解码；都失败才用替换字符。
+# BOM 是"这是文本"的强信号；只按 BOM 认 UTF-16/UTF-32，不做统计猜测。
+_TEXT_BOMS: tuple[tuple[bytes, str], ...] = (
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xff\xfe\x00\x00", "utf-32-le"),      # 必须排在 utf-16-le 前面
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xfe\xff", "utf-16-be"),
+)
+
+
+def _looks_binary(raw: bytes) -> bool:
+    """没有 BOM 且 NUL 占比很高时按二进制处理，避免把 .sup 之类当文本字幕。"""
+    sample = raw[:8192]
+    if not sample or any(sample.startswith(bom) for bom, _ in _TEXT_BOMS):
+        return False
+    nuls = sample.count(b"\x00")
+    return nuls > 0 and nuls / len(sample) > 0.10
+
+
+def detect_text_encoding(raw: bytes) -> str:
+    """按 BOM → UTF-8 → GB18030 判编码；全失败时返回 utf-8 交给 strict 解码报错。"""
+    for bom, encoding in _TEXT_BOMS:
+        if raw.startswith(bom):
+            return encoding
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            raw.decode(encoding)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    return "utf-8"
+
+
+def decode_text(raw: bytes, strict: bool = False) -> str:
+    """按 BOM/UTF-8/GB18030 解码；strict=False 时用替换字符兜底。
 
     中文 .srt 很多是 GBK 编码，直接按 UTF-8 读会得到乱码或让 ffmpeg 解析失败。
     """
-    for encoding in ("utf-8-sig", "gb18030"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", "replace")
+    encoding = detect_text_encoding(raw)
+    try:
+        text = raw.decode(encoding)
+    except UnicodeDecodeError as exc:
+        if strict:
+            raise ValueError(
+                "字幕编码无法识别（已尝试 UTF-8 / UTF-16(BOM) / GB18030）；"
+                "请把字幕另存为 UTF-8 后重试"
+            ) from exc
+        return raw.decode("utf-8", "replace")
+    # utf-16-le / utf-32-le 这类显式端序解码不会吞掉 BOM，自己去掉，
+    # 否则 json.loads 会报 "Unexpected UTF-8 BOM"，时间轴首行也会多一个字符。
+    return text[1:] if text.startswith("\ufeff") else text
 
 
 def load_cues(path: Path) -> list[dict]:
@@ -421,9 +461,12 @@ def ensure_playable(path: Path, suffix: str) -> None:
     结果就是视频合并成功、字幕却什么都没留下——这里提前拦住。
     """
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        raw = path.read_bytes()
     except OSError as exc:
         raise ValueError(f"字幕无法读取：{exc}") from exc
+    if _looks_binary(raw):
+        raise ValueError("字幕文件看起来是二进制（不是文本字幕），请确认扩展名与内容一致")
+    text = decode_text(raw)
     suffix = suffix.lower()
     if suffix in (".srt", ".vtt"):
         if not _cue_pattern(suffix).search(text):
@@ -512,21 +555,16 @@ def prepare_subtitle(tools: Tools, subtitle: Path, workdir: Path) -> tuple[Path,
         return target, target
 
     raw = subtitle.read_bytes()
-    try:
-        text = raw.decode("utf-8-sig")
-        encoding = "utf-8"
-    except UnicodeDecodeError:
-        try:
-            text = raw.decode("gb18030")
-            encoding = "gb18030"
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"字幕编码无法识别（既不是 UTF-8 也不是 GBK）：{exc}") from exc
+    if _looks_binary(raw):
+        raise ValueError("字幕文件看起来是二进制（不是文本字幕），请确认扩展名与内容一致")
+    encoding = detect_text_encoding(raw)
+    text = decode_text(raw, strict=True)        # UTF-8 / UTF-16(BOM) / GB18030
 
     had_nul = "\x00" in text
     if had_nul:
         text = text.replace("\x00", "")         # NUL 会让 SRT 解析器整条失效
 
-    if encoding == "utf-8" and not had_nul:
+    if encoding in ("utf-8", "utf-8-sig") and not had_nul:
         ensure_playable(subtitle, subtitle.suffix)
         return subtitle, None                    # 本来就是 UTF-8，直接用原文件
 
