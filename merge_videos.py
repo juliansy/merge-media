@@ -8,6 +8,9 @@
 只补“视频缺、目录有”的那一部分，一次 ffmpeg 调用完成封装，校验通过后原子替换原视频，
 失败则原样保留所有源文件。最后逐条汇报：哪个视频合并了、补了哪几轨、是否齐全。
 
+同名字幕与“同名 + 语言后缀”的字幕（x.en.vtt / x.zh-Hans.srt / x_zh.json）都会发现，
+同一个视频可以一次并入多条不同语言字幕；--sub-lang 只作用于没有语言后缀的那条。
+
 容器差异由 CONTAINERS 表集中管理：MP4 家族（.mp4/.m4v）字幕转 mov_text、
 音频只接受 AAC/MP3/AC3/E-AC3/ALAC（其它编码跳过并提示改用 .mkv 或先转码）、
 封面写 attached_pic；Matroska（.mkv）字幕与音频都原样 copy（PGS/ASS/Opus/FLAC 均可），
@@ -56,7 +59,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Sequence
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 AUDIO_EXTS = (".m4a", ".aac", ".mp3", ".opus", ".flac", ".ogg", ".wav")
 # 入口白名单 = "ffmpeg 能当文本/图形字幕读出来"的格式；不在这里的后缀一律不发现。
@@ -198,6 +201,8 @@ def brief_error(text: str, target: Optional[Path] = None, limit: int = 160) -> s
 class SubStream:
     index: int
     codec: str
+    language: str = ""
+    duration: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -316,7 +321,7 @@ def probe(tools: Tools, path: Path) -> Probe:
         return str(tags.get(name) or tags.get(name.upper()) or "")
 
     sub_streams = tuple(
-        SubStream(index, codec(stream))
+        SubStream(index, codec(stream), tag(stream, "language"), stream_duration(stream))
         for index, stream in enumerate(streams)
         if kind(stream) == "subtitle"
     )
@@ -371,17 +376,27 @@ def probe_audio_codec(tools: Tools, path: Path) -> str:
 
 
 @dataclass(frozen=True)
+class Subtitle:
+    """一个字幕侧车；tag 是文件名里的语言标签（x.en.vtt → "en"），空表示同名无标签。"""
+
+    path: Path
+    tag: str = ""
+
+
+@dataclass(frozen=True)
 class Sidecars:
     audio: Optional[Path] = None
-    subtitle: Optional[Path] = None
+    subtitles: tuple[Subtitle, ...] = ()
     cover: Optional[Path] = None
 
-    @property
-    def tracks(self) -> dict[str, Optional[Path]]:
-        return {TRACK_AUDIO: self.audio, TRACK_SUB: self.subtitle, TRACK_COVER: self.cover}
-
     def paths(self) -> list[Path]:
-        return [p for p in self.tracks.values() if p is not None]
+        found: list[Path] = []
+        if self.audio:
+            found.append(self.audio)
+        found += [sub.path for sub in self.subtitles]
+        if self.cover:
+            found.append(self.cover)
+        return found
 
 
 def _usable(path: Path) -> bool:
@@ -426,12 +441,104 @@ def pick_sidecar(video: Path, exts: Iterable[str]) -> Optional[Path]:
     return None
 
 
+# 语言标签：en / zh-Hans / en-orig / chs 这类；点或下划线分隔都接受。
+_LANG_TAG_RE = re.compile(r"^[a-z]{2,3}(?:[-_][a-z0-9]{1,8})*$", re.IGNORECASE)
+
+
+def _language_tag(rest: str) -> str:
+    """把文件名里剥出来的语言段规范成小写标签；不合格返回空串。"""
+    tag = rest.strip("._- ")
+    return tag.lower() if _LANG_TAG_RE.match(tag) else ""
+
+
+def pick_subtitles(video: Path) -> tuple[Subtitle, ...]:
+    """找同名字幕与“同名 + 语言后缀”的字幕（x.en.vtt / x_zh.json）。
+
+    同一视频可以有多条不同语言字幕，一次封装全部并入；顺序固定：无标签的同名
+    字幕在前，其余按标签、文件名排序，保证 dry-run 多次输出一致。
+    """
+    found: list[Subtitle] = []
+    seen: set[str] = set()
+
+    for ext in SUB_EXTS:
+        candidate = video.with_name(video.stem + ext)
+        if _usable(candidate):
+            found.append(Subtitle(candidate, ""))
+            seen.add(str(candidate).casefold())
+
+    target = unicodedata.normalize("NFC", video.stem)
+    target_cf = target.casefold()
+    wanted = {ext.lower() for ext in SUB_EXTS}
+    for nfc_stem, suffix, name in directory_sidecar_index(str(video.parent)):
+        if suffix not in wanted:
+            continue
+        stem_cf = nfc_stem.casefold()
+        if not stem_cf.startswith(target_cf):
+            continue
+        rest = nfc_stem[len(target):]
+        if not rest or rest[0] not in "._":
+            continue
+        tag = _language_tag(rest[1:])
+        if not tag:
+            continue
+        candidate = video.parent / name
+        key = str(candidate).casefold()
+        if key in seen or not _usable(candidate):
+            continue
+        seen.add(key)
+        found.append(Subtitle(candidate, tag))
+
+    found.sort(key=lambda item: (item.tag != "", item.tag, item.path.name.casefold()))
+    return tuple(found)
+
+
 def find_sidecars(video: Path) -> Sidecars:
     return Sidecars(
         audio=pick_sidecar(video, AUDIO_EXTS),
-        subtitle=pick_sidecar(video, SUB_EXTS),
+        subtitles=pick_subtitles(video),
         cover=pick_sidecar(video, COVER_EXTS),
     )
+
+
+# BCP-47 / 常见二字码 → ISO 639-2/B（mp4 的 language tag 不接受 BCP-47 原样）。
+_LANGUAGE_CODES = {
+    "en": "eng", "eng": "eng",
+    "zh": "chi", "zh-hans": "chi", "zh-hant": "chi", "zh-cn": "chi", "zh-tw": "chi",
+    "zh-hk": "chi", "chs": "chi", "cht": "chi", "chi": "chi",
+    "ja": "jpn", "jp": "jpn", "jpn": "jpn",
+    "ko": "kor", "kor": "kor",
+    "fr": "fra", "fre": "fra", "fra": "fra",
+    "de": "deu", "ger": "deu", "deu": "deu",
+    "es": "spa", "spa": "spa",
+    "ru": "rus", "rus": "rus",
+    "pt": "por", "por": "por",
+    "it": "ita", "ita": "ita",
+    "ar": "ara", "ara": "ara",
+    "hi": "hin", "hin": "hin",
+    "th": "tha", "tha": "tha",
+    "vi": "vie", "vie": "vie",
+    "id": "ind", "ind": "ind",
+    "tr": "tur", "tur": "tur",
+    "pl": "pol", "pol": "pol",
+    "nl": "nld", "dut": "nld", "nld": "nld",
+    "sv": "swe", "swe": "swe",
+    "uk": "ukr", "ukr": "ukr",
+}
+
+
+def language_code(tag: str) -> str:
+    """把文件名里的语言标签（en / zh-Hans / en-orig）转成三字码；未知返回 und。"""
+    key = tag.strip().lower()
+    if not key:
+        return "und"
+    if key in _LANGUAGE_CODES:
+        return _LANGUAGE_CODES[key]
+    primary = re.split(r"[-_]", key)[0]
+    if primary in _LANGUAGE_CODES:
+        return _LANGUAGE_CODES[primary]
+    if len(key) == 3 and key.isalpha():
+        return key
+    return "und"
 
 
 # --------------------------------------------------------------------------- #
@@ -776,7 +883,7 @@ class Plan:
     side: Sidecars
     container: Container
     add_audio: Optional[Path] = None
-    add_sub: Optional[Path] = None
+    add_subs: tuple[Subtitle, ...] = ()
     add_cover: Optional[Path] = None
     skip_reason: str = ""
     # 已有字幕里真正会写进产物的那些（MP4 下图像字幕被剔除），命令拼装与校验都以它为准。
@@ -786,17 +893,21 @@ class Plan:
 
     @property
     def additions(self) -> dict[str, Optional[Path]]:
-        return {TRACK_AUDIO: self.add_audio, TRACK_SUB: self.add_sub, TRACK_COVER: self.add_cover}
+        return {
+            TRACK_AUDIO: self.add_audio,
+            TRACK_SUB: self.add_subs[0].path if self.add_subs else None,
+            TRACK_COVER: self.add_cover,
+        }
 
     @property
     def has_work(self) -> bool:
-        return bool(self.add_audio or self.add_sub or self.add_cover)
+        return bool(self.add_audio or self.add_subs or self.add_cover)
 
     def expected_tracks(self) -> dict[str, bool]:
         """处理完成后应存在的轨道。"""
         return {
             TRACK_AUDIO: self.probe.has_audio or bool(self.add_audio),
-            TRACK_SUB: bool(self.kept_subtitles) or bool(self.add_sub),
+            TRACK_SUB: bool(self.kept_subtitles) or bool(self.add_subs),
             TRACK_COVER: (self.probe.has_cover and self.covers_kept) or bool(self.add_cover),
         }
 
@@ -807,13 +918,23 @@ def make_plan(video: Path, pr: Probe, side: Sidecars, container: Container) -> P
         if not (container.kind == "mp4" and sub.codec in BITMAP_SUB_CODECS)
     )
     dropped = tuple(sub.codec for sub in pr.sub_streams if sub not in kept)
+    if pr.has_subs:
+        # 已有字幕时不重复同语言：只补文件名里带新语言标签的侧车；同名无标签的仍跳过。
+        existing = {
+            language_code(sub.language)
+            for sub in pr.sub_streams
+            if sub.language and sub.language != "und"
+        }
+        add_subs = tuple(sub for sub in side.subtitles if sub.tag and language_code(sub.tag) not in existing)
+    else:
+        add_subs = side.subtitles
     plan = Plan(
         video=video,
         probe=pr,
         side=side,
         container=container,
         add_audio=None if pr.has_audio else side.audio,
-        add_sub=None if pr.has_subs else side.subtitle,
+        add_subs=add_subs,
         add_cover=None if pr.has_cover else side.cover,
         kept_subtitles=kept,
         dropped_subtitles=dropped,
@@ -873,9 +994,16 @@ def guess_subtitle_language(text: str) -> str:
     return "eng"
 
 
-def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
+@dataclass(frozen=True)
+class SubtitleInput:
+    """已预处理、可直接丢给 ffmpeg 的字幕，以及它最终要写的语言码。"""
+
+    path: Path
+    language: str
+
+
+def build_command(tools: Tools, plan: Plan, subtitles: Sequence[SubtitleInput],
                   cover: Optional[Path], dest: Path, with_title: bool,
-                  sub_lang: str = "auto",
                   attachments: Sequence[Attachment] = ()) -> list[str]:
     """组织 ffmpeg 参数。
 
@@ -897,9 +1025,10 @@ def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
     if plan.add_audio:
         index["audio"] = len(inputs)
         inputs.append((plan.add_audio, "audio"))
-    if subtitle:
-        index["sub"] = len(inputs)
-        inputs.append((subtitle, "sub"))
+    sub_indices: list[int] = []
+    for sub in subtitles:
+        sub_indices.append(len(inputs))
+        inputs.append((sub.path, "sub"))
     if cover and container.cover_mode == "video":
         index["cover"] = len(inputs)
         inputs.append((cover, "cover"))
@@ -920,23 +1049,18 @@ def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
         cmd += ["-map", "0:t?"]                    # 字体等附件；? 让没有附件时也不报错
     if plan.add_audio:
         cmd += ["-map", f"{index['audio']}:a:0"]
-    if subtitle:
-        cmd += ["-map", f"{index['sub']}:s:0"]
+    for sub_index in sub_indices:                  # 新增字幕逐条 map，输出顺序与 --sub-lang 一致
+        cmd += ["-map", f"{sub_index}:s:0"]
     if cover and container.cover_mode == "video":
         cmd += ["-map", f"{index['cover']}:v:0"]
 
     cmd += ["-c:v", "copy", "-c:a", "copy"]
-    if plan.kept_subtitles or subtitle:
+    if plan.kept_subtitles or subtitles:
         cmd += ["-c:s", container.subtitle_codec]
-    if subtitle:
-        # 新增字幕排在原有字幕之后；语言用 --sub-lang，默认按文字内容识别
-        language = sub_lang
-        if language == "auto":
-            try:
-                language = guess_subtitle_language(subtitle.read_text(encoding="utf-8", errors="replace"))
-            except OSError:
-                language = "und"
-        cmd += ["-metadata:s:s:%d" % len(plan.kept_subtitles), f"language={language}"]
+    if subtitles:
+        # 新增字幕接在原有字幕之后，逐个写语言码（已在 process_video 里按标签/内容定好）。
+        for offset, sub in enumerate(subtitles):
+            cmd += ["-metadata:s:s:%d" % (len(plan.kept_subtitles) + offset), f"language={sub.language}"]
 
     if container.cover_mode == "video":
         # 输出视频流 [正片, 封面...]：正片固定 v:0，封面从 v:1 开始逐条打 attached_pic。
@@ -978,10 +1102,12 @@ def verify_output(tools: Tools, dest: Path, plan: Plan) -> list[str]:
         problems.append("缺视频流")
     if expected[TRACK_AUDIO] and not pr.has_audio:
         problems.append("缺音轨")
-    if expected[TRACK_SUB] and not pr.has_subs:
-        problems.append("缺字幕轨")
-    if plan.add_sub is not None and pr.has_subs and pr.sub_duration <= 0.0:
-        problems.append("字幕轨是空的（源字幕没有可解析的条目）")
+    expected_subs = len(plan.kept_subtitles) + len(plan.add_subs)
+    if expected[TRACK_SUB] and len(pr.sub_streams) < expected_subs:
+        problems.append(f"字幕轨数量不足（期望 {expected_subs}，实际 {len(pr.sub_streams)}）")
+    new_subs = pr.sub_streams[len(plan.kept_subtitles):]
+    if plan.add_subs and any(sub.duration <= 0.0 for sub in new_subs[:len(plan.add_subs)]):
+        problems.append("新增字幕轨是空的（源字幕没有可解析的条目）")
     if expected[TRACK_COVER] and not pr.has_cover:
         problems.append("缺封面")
     if plan.probe.duration > 0 and abs(pr.duration - plan.probe.duration) > DURATION_TOLERANCE:
@@ -1018,7 +1144,11 @@ def marks(tracks: dict[str, bool]) -> str:
 
 
 def sidecar_marks(side: Sidecars) -> dict[str, bool]:
-    return {name: path is not None for name, path in side.tracks.items()}
+    return {
+        TRACK_AUDIO: side.audio is not None,
+        TRACK_SUB: bool(side.subtitles),
+        TRACK_COVER: side.cover is not None,
+    }
 
 
 def clean_stale_temps(directory: Path, stem: str, suffix: str) -> None:
@@ -1093,13 +1223,16 @@ def process_video(ctx: "Context", video: Path) -> Result:
         note = ("将并入 " + "+".join(added)) if added else "没有可并入的内容"
         if plan.dropped_subtitles:
             note += f"；原图形字幕（{'/'.join(sorted(set(plan.dropped_subtitles)))}）无法放入 MP4，将丢弃"
-        if plan.add_sub and plan.add_sub.suffix.lower() == ".json":
+        for entry in plan.add_subs:
+            if entry.path.suffix.lower() != ".json":
+                continue
             try:
-                note += f"（字幕 {len(load_cues(plan.add_sub))} 条）"
+                note += f"（{entry.path.name} {len(load_cues(entry.path))} 条）"
             except (ValueError, OSError) as exc:
-                plan.add_sub = None              # 否则“结果”列会声称齐全
-                added = [name for name in added if name != TRACK_SUB]
-                note = f"预演：字幕 JSON 无法读取（{exc}），其余将并入 " + ("+".join(added) or "无")
+                plan.add_subs = tuple(sub for sub in plan.add_subs if sub != entry)
+                if not plan.add_subs:
+                    added = [name for name in added if name != TRACK_SUB]
+                note = f"预演：字幕 {entry.path.name} 无法读取（{exc}），其余将并入 " + ("+".join(added) or "无")
         if audio_problem:
             note += "；" + audio_problem
         missing = [name for name, ok in plan.expected_tracks().items() if not ok and name not in added]
@@ -1117,16 +1250,29 @@ def process_video(ctx: "Context", video: Path) -> Result:
         warnings.append(f"原图形字幕（{'/'.join(sorted(set(plan.dropped_subtitles)))}）无法放入 MP4，已丢弃")
 
     try:
-        subtitle: Optional[Path] = None
+        subtitles: list[SubtitleInput] = []
         cover: Optional[Path] = None
-        if plan.add_sub:
+        kept_entries: list[Subtitle] = []
+        for entry in plan.add_subs:
             try:
-                subtitle, tmp = prepare_subtitle(ctx.tools, plan.add_sub, workdir)
+                path, tmp = prepare_subtitle(ctx.tools, entry.path, workdir)
                 if tmp:
                     temporary.append(tmp)
             except (ValueError, OSError) as exc:
-                warnings.append(f"字幕未并入（{exc}）")
-                plan.add_sub = None
+                warnings.append(f"字幕未并入（{entry.path.name}：{exc}）")
+                continue
+            if entry.tag:
+                language = language_code(entry.tag)      # 文件名标签优先
+            elif ctx.sub_lang != "auto":
+                language = ctx.sub_lang                  # --sub-lang 只作用于无标签字幕
+            else:
+                try:
+                    language = guess_subtitle_language(path.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    language = "und"
+            kept_entries.append(entry)
+            subtitles.append(SubtitleInput(path, language))
+        plan.add_subs = tuple(kept_entries)
 
         if plan.add_cover:
             try:
@@ -1152,8 +1298,7 @@ def process_video(ctx: "Context", video: Path) -> Result:
                           time.perf_counter() - started,
                           warnings_note(warnings) or "没有可并入的内容")
 
-        cmd = build_command(ctx.tools, plan, subtitle, cover, dest, ctx.with_title,
-                            ctx.sub_lang, attachments)
+        cmd = build_command(ctx.tools, plan, subtitles, cover, dest, ctx.with_title, attachments)
         proc = run_command(cmd, FFMPEG_TIMEOUT)
         if proc.returncode != 0:
             return Result(video, "failed", before, available, [], [],
@@ -1221,15 +1366,31 @@ def delete_sources(ctx: "Context", plan: Plan, added: Sequence[str]) -> list[Pat
     必须留下，否则用户丢的是唯一一份素材。
     """
     candidates: list[Path] = []
-    for name in added:
-        path = plan.additions[name]
-        if path:
-            candidates.append(path)
+    if plan.add_audio and TRACK_AUDIO in added:
+        candidates.append(plan.add_audio)
+    if plan.add_cover and TRACK_COVER in added:
+        candidates.append(plan.add_cover)
+    candidates.extend(entry.path for entry in plan.add_subs)   # 多语言字幕逐条都算已并入
+
     if ctx.purge:
-        for name, path in plan.side.tracks.items():
-            if path and name not in added and plan.probe.tracks[name]:
-                candidates.append(path)
-    return remove_files(ctx, candidates)
+        if plan.side.audio and plan.add_audio is None and plan.probe.has_audio:
+            candidates.append(plan.side.audio)
+        if plan.side.cover and plan.add_cover is None and plan.probe.has_cover:
+            candidates.append(plan.side.cover)
+        if plan.probe.has_subs:
+            merged = {str(entry.path).casefold() for entry in plan.add_subs}
+            for entry in plan.side.subtitles:
+                if str(entry.path).casefold() not in merged:
+                    candidates.append(entry.path)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return remove_files(ctx, unique)
 
 
 # --------------------------------------------------------------------------- #
@@ -1447,6 +1608,20 @@ def collect_videos(paths: Sequence[Path], recursive: bool = False) -> list[Path]
 
 def find_orphans(directories: Iterable[Path], videos: Sequence[Path]) -> dict[Path, list[Path]]:
     stems = {unicodedata.normalize("NFC", str(v.with_suffix(""))).casefold() for v in videos}
+
+    def matched(stem: str, suffix: str) -> bool:
+        if stem in stems:
+            return True
+        # 语言后缀字幕（x.en.vtt / x_zh.json）也算被对应视频“认领”，不再列成孤立附件。
+        if suffix not in SUB_EXTS:
+            return False
+        for base in stems:
+            if stem.startswith(base):
+                rest = stem[len(base):]
+                if rest[:1] in "._" and _language_tag(rest[1:]):
+                    return True
+        return False
+
     result: dict[Path, list[Path]] = {}
     for directory in {d.resolve() for d in directories}:
         if not directory.is_dir():
@@ -1457,7 +1632,8 @@ def find_orphans(directories: Iterable[Path], videos: Sequence[Path]) -> dict[Pa
                 continue
             if item.name.startswith("."):
                 continue
-            if unicodedata.normalize("NFC", str(item.with_suffix(""))).casefold() not in stems:
+            stem = unicodedata.normalize("NFC", str(item.with_suffix(""))).casefold()
+            if not matched(stem, item.suffix.lower()):
                 items.append(item)
         if items:
             result[directory] = items
@@ -1569,7 +1745,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("-q", "--quiet", action="store_true", help="只输出汇总")
     parser.add_argument("--no-title", action="store_true", help="不写入 title 元数据")
     parser.add_argument("--sub-lang", default="auto",
-                        help="新增字幕的语言标记：auto 自动识别，或 chi/eng/jpn…")
+                        help="无语言后缀的新增字幕语言标记：auto 自动识别，或 chi/eng/jpn…")
     parser.add_argument("--ffmpeg", help="ffmpeg 路径")
     parser.add_argument("--ffprobe", help="ffprobe 路径")
     parser.add_argument("--log", help="同时写入日志文件")
