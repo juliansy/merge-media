@@ -23,13 +23,13 @@
 
 This tool is for a download that finished without being assembled: one file holds the picture, another holds the sound, and the subtitles and cover art sit beside them. Put `merge_videos.py` and `merge.bat` into that folder and run it — you get one video (`.mp4`, `.m4v` or `.mkv`) with all of them inside. Video and audio are copied as they are, so nothing is re-encoded.
 
-**Download:** [latest release](https://github.com/juliansy/merge-media/releases/latest) — a zip with `merge_videos.py`, `merge.bat`, both READMEs and the license.
+**Download:** [latest release](https://github.com/juliansy/merge-media/releases/latest) — a zip with `merge_videos.py`, `merge.bat`, both READMEs, the changelog and the license.
 
 ## What it does
 
 - Merges `name.mp4` and `name.m4a` into one file, keeping the video's container (`.mp4`/`.m4v`/`.mkv`).
 - Audio sidecars: `.m4a`, `.aac`, `.mp3`, `.opus`, `.flac`, `.ogg`, `.wav`. MP4 only accepts AAC/MP3/AC3/E-AC3/ALAC; other codecs are skipped with a note (use `.mkv`, or convert the audio), while the rest of the merge continues.
-- Embeds subtitles: `.json` (Bilibili subtitle export), `.ass`, `.ssa`, `.srt`, `.vtt` — the plain same-name file plus any number of language-suffixed files (`name.en.vtt`, `name.zh-Hans.srt`, `name_zh.json`). Each becomes its own track, tagged with the language from its suffix.
+- Embeds subtitles: `.json` (Bilibili subtitle export), `.ass`, `.ssa`, `.srt`, `.vtt` — the plain same-name file (if several same-name formats exist, the first by priority `.ass`, `.ssa`, `.srt`, `.json`, `.vtt` wins) plus any number of language-suffixed files (`name.en.vtt`, `name.zh-Hans.srt`, `name_zh.json`). Each becomes its own track, tagged with the language from its suffix.
 - Attaches a cover: `.jpg`, `.jpeg`, `.png`, `.webp`, `.avif`, `.bmp`, `.gif`, `.tif`, `.tiff`; anything that is not JPEG is converted first. AVIF needs an ffmpeg with an AV1 decoder (the "full" build).
 - Adds only what is missing: audio, subtitles and cover already inside the video stay untouched. A sidecar whose language already exists is skipped instead of duplicated.
 - Prints what it merged and whether the result is complete.
@@ -97,10 +97,15 @@ Dropping things on the icon works too:
 | `-n`, `--dry-run` | Analyze only; nothing is written |
 | `-k`, `--keep` | Keep every source file |
 | `-p`, `--purge` | Also delete sidecars the video did not need |
-| `-j N` | Process N files at the same time |
-| `-R` | Include subfolders |
+| `-j N`, `--jobs N` | Process N files at the same time |
+| `-R`, `--recursive` | Include subfolders |
+| `-q`, `--quiet` | Print only the summary |
+| `--no-title` | Do not write the `title` metadata tag |
 | `--sub-lang LANG` | Language tag for added subtitles without a language suffix; `auto` guesses from the text |
-| `-V` | Print the version |
+| `--ffmpeg PATH` | Use this ffmpeg binary |
+| `--ffprobe PATH` | Use this ffprobe binary |
+| `--log FILE` | Also append the output to a log file |
+| `-V`, `--version` | Print the version |
 
 `python merge_videos.py -h` lists every option.
 
@@ -138,7 +143,7 @@ The console output is in Chinese. Read the columns left to right: what the video
 
 ## Tests
 
-The pure helpers (timestamps, subtitle parsing, language tags, sidecar discovery) have unit tests that need no ffmpeg:
+The unit tests cover the pure helpers (timestamps, encoding detection, language tags, sidecar discovery, command assembly) and, when `ffmpeg` is on `PATH`, the subtitle validation and preparation paths as well:
 
 ```text
 python -m unittest test_merge_videos -v

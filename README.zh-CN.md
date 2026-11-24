@@ -23,13 +23,13 @@
 
 这个脚本针对的是一种情况：下载已经完成，但文件没有合并——画面在一个文件里，声音在另一个文件里，字幕和封面放在旁边。把 `merge_videos.py` 和 `merge.bat` 放进这个文件夹并运行，就能得到一个包含这些东西的视频文件（`.mp4`/`.m4v`/`.mkv`）。音视频按原样复制，不重新编码。
 
-**下载：**[最新版本](https://github.com/juliansy/merge-media/releases/latest)——压缩包里是 `merge_videos.py`、`merge.bat`、两份 README 和许可证。
+**下载：**[最新版本](https://github.com/juliansy/merge-media/releases/latest)——压缩包里是 `merge_videos.py`、`merge.bat`、两份 README、更新日志和许可证。
 
 ## 它做什么
 
 - 把 `name.mp4` 与 `name.m4a` 合成一个文件，保持视频原来的容器（`.mp4`/`.m4v`/`.mkv`）。
 - 音频附件：`.m4a`、`.aac`、`.mp3`、`.opus`、`.flac`、`.ogg`、`.wav`。MP4 只接受 AAC/MP3/AC3/E-AC3/ALAC，其它编码会跳过并提示（改用 `.mkv` 或先转码），其余轨道照常合并。
-- 内嵌字幕：`.json`（B 站字幕导出）、`.ass`、`.ssa`、`.srt`、`.vtt`——同名文件，以及任意多个带语言后缀的文件（`name.en.vtt`、`name.zh-Hans.srt`、`name_zh.json`）。每条各占一轨，语言取自后缀。
+- 内嵌字幕：`.json`（B 站字幕导出）、`.ass`、`.ssa`、`.srt`、`.vtt`——同名文件（同时存在多种格式时按 `.ass`、`.ssa`、`.srt`、`.json`、`.vtt` 优先级取一个），以及任意多个带语言后缀的文件（`name.en.vtt`、`name.zh-Hans.srt`、`name_zh.json`）。每条各占一轨，语言取自后缀。
 - 内嵌封面：`.jpg`、`.jpeg`、`.png`、`.webp`、`.avif`、`.bmp`、`.gif`、`.tif`、`.tiff`；不是 JPEG 的会先转成 JPEG。AVIF 需要带 AV1 解码器的 ffmpeg（full 版）。
 - 只补缺的：视频里已有的音频、字幕、封面一律原样保留；已有同语言字幕时跳过对应附件，不重复添加。
 - 打印这次并入了什么，以及结果是否齐全。
@@ -97,10 +97,15 @@ PowerShell 不从当前目录运行程序，直接写 `merge.bat` 会报 `Comman
 | `-n`, `--dry-run` | 只分析，不写文件 |
 | `-k`, `--keep` | 保留所有源文件 |
 | `-p`, `--purge` | 连视频用不上的同名附件一起删 |
-| `-j N` | 同时处理 N 个文件 |
-| `-R` | 连子目录一起处理 |
+| `-j N`, `--jobs N` | 同时处理 N 个文件 |
+| `-R`, `--recursive` | 连子目录一起处理 |
+| `-q`, `--quiet` | 只输出汇总 |
+| `--no-title` | 不写入 `title` 元数据 |
 | `--sub-lang LANG` | 没有语言后缀的新增字幕语言标记；`auto` 按文字内容猜 |
-| `-V` | 显示版本 |
+| `--ffmpeg PATH` | 指定 ffmpeg 可执行文件 |
+| `--ffprobe PATH` | 指定 ffprobe 可执行文件 |
+| `--log FILE` | 同时追加写入日志文件 |
+| `-V`, `--version` | 显示版本 |
 
 完整参数见 `python merge_videos.py -h`。
 
@@ -138,7 +143,7 @@ PowerShell 不从当前目录运行程序，直接写 `merge.bat` 会报 `Comman
 
 ## 测试
 
-纯函数（时间戳、字幕解析、语言标签、附件发现）有单元测试，不需要 ffmpeg：
+单元测试覆盖纯函数（时间戳、编码识别、语言标签、附件发现、命令拼装）；`ffmpeg` 在 `PATH` 里时还会跑字幕校验与预处理，缺 ffmpeg 时自动跳过这些用例：
 
 ```text
 python -m unittest test_merge_videos -v
