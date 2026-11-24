@@ -2,16 +2,22 @@
 # -*- coding: utf-8 -*-
 """merge_videos.py -- 批量合并分离的视频、音频、字幕与封面。
 
-扫描目标目录里的 *.mp4，用 ffprobe 读出每个视频**已有**的音轨 / 字幕轨 / 封面，
-再在目录里找同名的侧车文件（.m4a/.aac/.mp3、.ass/.ssa/.srt/.json/.vtt、
-.jpg/.jpeg/.png/.webp/.avif/.bmp/.gif/.tif/.tiff）。
+扫描目标目录里的视频（.mp4/.m4v/.mkv），用 ffprobe 读出每个视频**已有**的
+音轨 / 字幕轨 / 封面，再在目录里找同名的侧车文件（.m4a/.aac/.mp3、
+.ass/.ssa/.srt/.json/.vtt、.jpg/.jpeg/.png/.webp/.avif/.bmp/.gif/.tif/.tiff）。
 只补“视频缺、目录有”的那一部分，一次 ffmpeg 调用完成封装，校验通过后原子替换原视频，
 失败则原样保留所有源文件。最后逐条汇报：哪个视频合并了、补了哪几轨、是否齐全。
+
+容器差异由 CONTAINERS 表集中管理：MP4 家族（.mp4/.m4v）字幕转 mov_text、
+封面写 attached_pic；Matroska（.mkv）字幕原样 copy（PGS/ASS 不转码，MP4 里放不下的
+图像字幕在 MKV 里可以保留），封面写成附件。
+不收录 .mov：实测 ffmpeg 的 mov muxer 会静默丢弃 attached_pic 封面（返回 0 但产物
+没有封面流），无法保证“只补缺轨”的承诺，遇到时按不支持的容器报错。
 
 用法:
     merge_videos.py [路径 ...] [选项]
 
-    路径可以是目录（处理其中的 *.mp4），也可以是单个 .mp4；不带路径时处理脚本所在目录。
+    路径可以是目录（处理其中的视频），也可以是单个视频文件；不带路径时处理脚本所在目录。
 
 选项:
     -n, --dry-run       只分析并打印计划，不写任何文件
@@ -49,7 +55,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Sequence
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 AUDIO_EXTS = (".m4a", ".aac", ".mp3")
 # 入口白名单 = "ffmpeg 能当文本/图形字幕读出来"的格式；不在这里的后缀一律不发现。
@@ -58,8 +64,42 @@ SUB_EXTS = (".ass", ".ssa", ".srt", ".json", ".vtt")
 # 封面只放 ffmpeg 常见可解码的静态图；HEIC / JXL 依赖编译选项，故意不放行。
 COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".gif", ".tif", ".tiff")
 JPEG_EXTS = (".jpg", ".jpeg")
-VIDEO_EXTS = (".mp4",)
+
+
+@dataclass(frozen=True)
+class Container:
+    """输出容器的差异只放在这张表里，命令拼装读它的字段。
+
+    subtitle_codec: mp4 只认 mov_text；matroska 一律 copy（PGS/ASS 原样保留）。
+    cover_mode:     mp4 把封面当 attached_pic 视频流；matroska 必须写成 -attach 附件，
+                    因为 ffmpeg 重新 mux 时会把“视频流形式的封面”降级成普通 1 帧视频轨。
+    muxer_args:     只对 mp4/m4v 有意义的封装参数（+faststart）。
+    """
+
+    suffix: str
+    kind: str                       # "mp4" | "matroska"
+    subtitle_codec: str             # "mov_text" | "copy"
+    cover_mode: str                 # "video" | "attachment"
+    muxer_args: tuple[str, ...]
+
+
+CONTAINERS: dict[str, Container] = {
+    container.suffix: container
+    for container in (
+        Container(".mp4", "mp4", "mov_text", "video", ("-movflags", "+faststart")),
+        Container(".m4v", "mp4", "mov_text", "video", ("-movflags", "+faststart")),
+        Container(".mkv", "matroska", "copy", "attachment", ()),
+    )
+}
+VIDEO_EXTS = tuple(CONTAINERS)
 SIDECAR_EXTS = AUDIO_EXTS + SUB_EXTS + COVER_EXTS
+
+
+def container_for(path: Path) -> Container:
+    try:
+        return CONTAINERS[path.suffix.lower()]
+    except KeyError:
+        raise ValueError(f"不支持的视频容器：{path.suffix or '(无扩展名)'}") from None
 
 DURATION_TOLERANCE = 2.0     # 产物与原视频时长允许的差（秒）
 MIN_OUTPUT_BYTES = 1024
@@ -148,6 +188,29 @@ def brief_error(text: str, target: Optional[Path] = None, limit: int = 160) -> s
 # 探测：每个文件一次 ffprobe，拿全部轨道信息
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
+class SubStream:
+    index: int
+    codec: str
+
+
+@dataclass(frozen=True)
+class CoverStream:
+    index: int
+    codec: str
+    filename: str = ""
+    mimetype: str = ""
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """要写进 matroska 的附件（-attach）：已落盘的封面或原有字体。"""
+
+    path: Path
+    filename: str
+    mimetype: str
+
+
+@dataclass(frozen=True)
 class Probe:
     duration: float
     has_video: bool
@@ -165,12 +228,18 @@ class Probe:
     # 正片 = 第一条非 attached_pic 的视频流；封面 = 每条 attached_pic 视频流。
     # 不能假设“正片永远是 0:v:0、封面永远是 0:v:1”：第三方 muxer 可以换轨道顺序。
     main_video_index: int = 0
-    cover_indices: tuple[int, ...] = ()
+    sub_streams: tuple[SubStream, ...] = ()
+    cover_streams: tuple[CoverStream, ...] = ()
+    attachment_count: int = 0          # matroska 的字体等附件数量（-map 0:t 用）
     sub_duration: float = 0.0          # 字幕轨自身的时长，0 表示"有轨但没内容"
 
     @property
     def tracks(self) -> dict[str, bool]:
         return {TRACK_AUDIO: self.has_audio, TRACK_SUB: self.has_subs, TRACK_COVER: self.has_cover}
+
+    @property
+    def cover_indices(self) -> tuple[int, ...]:
+        return tuple(cover.index for cover in self.cover_streams)
 
 
 def probe(tools: Tools, path: Path) -> Probe:
@@ -205,7 +274,6 @@ def probe(tools: Tools, path: Path) -> Probe:
     subs = [s for s in streams if kind(s) == "subtitle"]
     covers = [stream for _, stream in video_streams if attached(stream)]
     main_video_index = next((index for index, stream in video_streams if not attached(stream)), 0)
-    cover_indices = tuple(index for index, stream in video_streams if attached(stream))
 
     try:
         duration = float(fmt.get("duration") or 0.0)
@@ -216,10 +284,41 @@ def probe(tools: Tools, path: Path) -> Probe:
         return str((item or {}).get("codec_name") or "")
 
     def stream_duration(item: Optional[dict]) -> float:
+        """优先读 duration，读不到再看 matroska 的 DURATION tag。
+
+        输出里带附件（-map 0:t?）时，ffprobe 会把同文件的字幕流 duration 报成 N/A，
+        但 DURATION tag 仍是准的；不兜底就会把正常字幕误判成“空字幕”。
+        """
+        stream = item or {}
         try:
-            return float((item or {}).get("duration") or 0.0)
+            value = float(stream.get("duration") or 0.0)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+        tags = stream.get("tags") or {}
+        stamp = str(tags.get("DURATION") or tags.get("duration") or "")
+        try:
+            hours, minutes, seconds = stamp.split(":")
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
         except (TypeError, ValueError):
             return 0.0
+
+    def tag(stream: dict, name: str) -> str:
+        tags = stream.get("tags") or {}
+        return str(tags.get(name) or tags.get(name.upper()) or "")
+
+    sub_streams = tuple(
+        SubStream(index, codec(stream))
+        for index, stream in enumerate(streams)
+        if kind(stream) == "subtitle"
+    )
+    cover_streams = tuple(
+        CoverStream(index, codec(stream), tag(stream, "filename"), tag(stream, "mimetype"))
+        for index, stream in video_streams
+        if attached(stream)
+    )
+    attachment_count = sum(1 for stream in streams if kind(stream) == "attachment")
 
     return Probe(
         duration=duration,
@@ -235,7 +334,9 @@ def probe(tools: Tools, path: Path) -> Probe:
         cover_codec=codec(covers[0] if covers else None),
         stream_count=len(streams),
         main_video_index=main_video_index,
-        cover_indices=cover_indices,
+        sub_streams=sub_streams,
+        cover_streams=cover_streams,
+        attachment_count=attachment_count,
         sub_duration=stream_duration(subs[0] if subs else None),
     )
 
@@ -575,7 +676,7 @@ def prepare_subtitle(tools: Tools, subtitle: Path, workdir: Path) -> tuple[Path,
 
 
 def prepare_cover(tools: Tools, cover: Path, workdir: Path) -> tuple[Path, Optional[Path]]:
-    """MP4 的 attached_pic 用 mjpeg 最稳；非 JPEG 先转一张临时 JPEG。"""
+    """封面统一转成 mjpeg 临时 JPEG：mp4 的 attached_pic 与 mkv 的 -attach 都用它。"""
     if cover.suffix.lower() in JPEG_EXTS:
         return cover, None
     target = workdir / "cover.jpg"
@@ -591,18 +692,71 @@ def prepare_cover(tools: Tools, cover: Path, workdir: Path) -> tuple[Path, Optio
     return target, target
 
 
+_COVER_EXTRACT = {
+    "mjpeg": ("jpg", "image/jpeg"),
+    "png": ("png", "image/png"),
+    "webp": ("webp", "image/webp"),
+    "bmp": ("bmp", "image/bmp"),
+}
+
+
+def extract_covers(tools: Tools, video: Path, pr: Probe,
+                   workdir: Path) -> tuple[list[Attachment], list[Path]]:
+    """把 mkv 里已有的 attached_pic 落成临时图片，供 -attach 回挂。
+
+    ffmpeg 的 matroska muxer 不能把“视频流形式的封面”再写成附件：直接
+    -map 0:v:N 只会得到一条 attached_pic=0 的普通 1 帧视频轨。所以先按流号
+    提取成图片，再 -attach；mjpeg/png 等用 -c copy 保留原始字节，失败才转 JPEG。
+    """
+    attachments: list[Attachment] = []
+    temps: list[Path] = []
+    for ordinal, cover in enumerate(pr.cover_streams):
+        attempts: list[tuple[str, str, list[str], str]] = []
+        if cover.codec in _COVER_EXTRACT:
+            ext, mime = _COVER_EXTRACT[cover.codec]
+            original = Path(cover.filename).name if cover.filename else ""
+            attempts.append((ext, mime, ["-c:v", "copy"], original or f"cover{ordinal}.{ext}"))
+        attempts.append(("jpg", "image/jpeg", ["-q:v", "2"], f"cover{ordinal}.jpg"))
+        error = ""
+        for ext, mime, encoding_args, filename in attempts:
+            target = workdir / f"cover{ordinal}.{ext}"
+            cmd = [
+                tools.ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
+                "-i", str(video), "-map", f"0:{cover.index}", "-frames:v", "1",
+                *encoding_args, str(target),
+            ]
+            proc = run_command(cmd, FFMPEG_TIMEOUT)
+            if proc.returncode == 0 and target.is_file() and target.stat().st_size > 0:
+                attachments.append(Attachment(target, filename, mime))
+                temps.append(target)
+                break
+            error = one_line(decode(proc.stderr)) or f"退出码 {proc.returncode}"
+        else:
+            raise ValueError(f"原有封面提取失败：{error}")
+    return attachments, temps
+
+
 # --------------------------------------------------------------------------- #
 # 计划
 # --------------------------------------------------------------------------- #
+# 图像字幕不能转 mov_text；MP4 里出现就丢弃并告知（MKV 可原样 copy）。
+BITMAP_SUB_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"})
+
+
 @dataclass
 class Plan:
     video: Path
     probe: Probe
     side: Sidecars
+    container: Container
     add_audio: Optional[Path] = None
     add_sub: Optional[Path] = None
     add_cover: Optional[Path] = None
     skip_reason: str = ""
+    # 已有字幕里真正会写进产物的那些（MP4 下图像字幕被剔除），命令拼装与校验都以它为准。
+    kept_subtitles: tuple[SubStream, ...] = ()
+    dropped_subtitles: tuple[str, ...] = ()
+    covers_kept: bool = True          # mkv 原有封面提取失败时置 False，避免校验误报
 
     @property
     def additions(self) -> dict[str, Optional[Path]]:
@@ -616,19 +770,27 @@ class Plan:
         """处理完成后应存在的轨道。"""
         return {
             TRACK_AUDIO: self.probe.has_audio or bool(self.add_audio),
-            TRACK_SUB: self.probe.has_subs or bool(self.add_sub),
-            TRACK_COVER: self.probe.has_cover or bool(self.add_cover),
+            TRACK_SUB: bool(self.kept_subtitles) or bool(self.add_sub),
+            TRACK_COVER: (self.probe.has_cover and self.covers_kept) or bool(self.add_cover),
         }
 
 
-def make_plan(video: Path, pr: Probe, side: Sidecars) -> Plan:
+def make_plan(video: Path, pr: Probe, side: Sidecars, container: Container) -> Plan:
+    kept = tuple(
+        sub for sub in pr.sub_streams
+        if not (container.kind == "mp4" and sub.codec in BITMAP_SUB_CODECS)
+    )
+    dropped = tuple(sub.codec for sub in pr.sub_streams if sub not in kept)
     plan = Plan(
         video=video,
         probe=pr,
         side=side,
+        container=container,
         add_audio=None if pr.has_audio else side.audio,
         add_sub=None if pr.has_subs else side.subtitle,
         add_cover=None if pr.has_cover else side.cover,
+        kept_subtitles=kept,
+        dropped_subtitles=dropped,
     )
     if not pr.has_video:
         plan.skip_reason = "没有可用的视频流"
@@ -687,15 +849,22 @@ def guess_subtitle_language(text: str) -> str:
 
 def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
                   cover: Optional[Path], dest: Path, with_title: bool,
-                  sub_lang: str = "auto") -> list[str]:
+                  sub_lang: str = "auto",
+                  attachments: Sequence[Attachment] = ()) -> list[str]:
     """组织 ffmpeg 参数。
 
     关键点：视频里**已有**的音轨 / 字幕 / 封面必须显式保留，否则只 map 新加的
     那一路会把它们丢掉。视频流一律用绝对流号（0:<idx>）定位：正片 = 第一条非
     attached_pic 的视频流，封面 = 每条 attached_pic 的视频流——不假设它们是
     v:0 / v:1（第三方 muxer 可以换轨道顺序）。输出顺序固定为 [正片, 封面...]。
+
+    容器差异（见 CONTAINERS）：
+    - MP4 家族：字幕必须转 mov_text（mp4 不接受 PGS/ASS），封面是 attached_pic 视频流；
+    - Matroska：字幕 copy（PGS/ASS/WebVTT 原样保留），封面必须用 -attach 写成附件，
+      因为 mkv 的“视频流封面”在 remux 后会退化成普通 1 帧视频轨。
     """
     pr = plan.probe
+    container = plan.container
     inputs: list[tuple[Path, str]] = [(plan.video, "video")]
     index = {"video": 0}
 
@@ -705,7 +874,7 @@ def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
     if subtitle:
         index["sub"] = len(inputs)
         inputs.append((subtitle, "sub"))
-    if cover:
+    if cover and container.cover_mode == "video":
         index["cover"] = len(inputs)
         inputs.append((cover, "cover"))
 
@@ -714,22 +883,25 @@ def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
         cmd += ["-i", str(path)]
 
     cmd += ["-map", f"0:{pr.main_video_index}"]     # 正片：第一条非 attached_pic 的视频流
-    for cover_index in pr.cover_indices:            # 原封面：可能不止一条，逐条按绝对下标 map
-        cmd += ["-map", f"0:{cover_index}"]
+    if container.cover_mode == "video":
+        for cover_index in pr.cover_indices:        # 原封面：可能不止一条，逐条按绝对下标 map
+            cmd += ["-map", f"0:{cover_index}"]
     if pr.audio_count:
         cmd += ["-map", "0:a"]                     # 原有全部音轨
-    if pr.sub_count:
-        cmd += ["-map", "0:s"]                     # 原有全部字幕
+    for sub in plan.kept_subtitles:                # 原有字幕逐条 map（MP4 下图像字幕已剔除）
+        cmd += ["-map", f"0:{sub.index}"]
+    if container.kind == "matroska":
+        cmd += ["-map", "0:t?"]                    # 字体等附件；? 让没有附件时也不报错
     if plan.add_audio:
         cmd += ["-map", f"{index['audio']}:a:0"]
     if subtitle:
         cmd += ["-map", f"{index['sub']}:s:0"]
-    if cover:
+    if cover and container.cover_mode == "video":
         cmd += ["-map", f"{index['cover']}:v:0"]
 
     cmd += ["-c:v", "copy", "-c:a", "copy"]
-    if pr.sub_count or subtitle:
-        cmd += ["-c:s", "mov_text"]
+    if plan.kept_subtitles or subtitle:
+        cmd += ["-c:s", container.subtitle_codec]
     if subtitle:
         # 新增字幕排在原有字幕之后；语言用 --sub-lang，默认按文字内容识别
         language = sub_lang
@@ -738,13 +910,29 @@ def build_command(tools: Tools, plan: Plan, subtitle: Optional[Path],
                 language = guess_subtitle_language(subtitle.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 language = "und"
-        cmd += ["-metadata:s:s:%d" % pr.sub_count, f"language={language}"]
-    # 输出视频流 [正片, 封面...]：正片固定 v:0，封面从 v:1 开始逐条打 attached_pic。
-    cover_outputs = len(pr.cover_indices) + (1 if cover else 0)
-    for offset in range(cover_outputs):
-        cmd += [f"-disposition:v:{offset + 1}", "attached_pic"]
-    cmd += ["-map_metadata", "0", "-movflags", "+faststart",
-            "-max_muxing_queue_size", "1024"]   # 大文件 remux 的 interleave 缓冲
+        cmd += ["-metadata:s:s:%d" % len(plan.kept_subtitles), f"language={language}"]
+
+    if container.cover_mode == "video":
+        # 输出视频流 [正片, 封面...]：正片固定 v:0，封面从 v:1 开始逐条打 attached_pic。
+        cover_outputs = len(pr.cover_indices) + (1 if cover else 0)
+        for offset in range(cover_outputs):
+            cmd += [f"-disposition:v:{offset + 1}", "attached_pic"]
+    else:
+        # mkv：附件（字体）先由 -map 0:t? 带过去，新附件从 attachment_count 开始编号。
+        attach_index = pr.attachment_count
+        for attachment in attachments:
+            cmd += ["-attach", str(attachment.path),
+                    f"-metadata:s:t:{attach_index}", f"filename={attachment.filename}",
+                    f"-metadata:s:t:{attach_index}", f"mimetype={attachment.mimetype}"]
+            attach_index += 1
+        if cover:
+            cmd += ["-attach", str(cover),
+                    f"-metadata:s:t:{attach_index}", "filename=cover.jpg",
+                    f"-metadata:s:t:{attach_index}", "mimetype=image/jpeg"]
+
+    cmd += ["-map_metadata", "0"]
+    cmd += list(container.muxer_args)              # 只有 mp4/m4v 需要 +faststart
+    cmd += ["-max_muxing_queue_size", "1024"]      # 大文件 remux 的 interleave 缓冲
     if with_title:
         cmd += ["-metadata", f"title={plan.video.stem}"]
     cmd.append(str(dest))
@@ -807,13 +995,16 @@ def sidecar_marks(side: Sidecars) -> dict[str, bool]:
     return {name: path is not None for name, path in side.tracks.items()}
 
 
-def clean_stale_temps(directory: Path, stem: str) -> None:
-    """清理上次异常中断留下的临时封装文件（超过 1 小时的才算，避免误删并发实例的）。"""
+def clean_stale_temps(directory: Path, stem: str, suffix: str) -> None:
+    """清理上次异常中断留下的临时封装文件（超过 1 小时的才算，避免误删并发实例的）。
+
+    临时文件后缀跟目标容器一致（.mkv 不会被 .mp4 的清理逻辑漏掉）。
+    """
     now = time.time()
     prefix = f".{stem}.mergetmp."
     try:
         for item in directory.iterdir():
-            if not item.name.startswith(prefix) or not item.name.endswith(".mp4"):
+            if not item.name.startswith(prefix) or not item.name.lower().endswith(suffix.lower()):
                 continue
             try:
                 if now - item.stat().st_mtime > STALE_TEMP_SECONDS:
@@ -827,13 +1018,18 @@ def clean_stale_temps(directory: Path, stem: str) -> None:
 def process_video(ctx: "Context", video: Path) -> Result:
     started = time.perf_counter()
     try:
+        container = container_for(video)
+    except ValueError as exc:
+        return Result(video, "failed", EMPTY_PROBE.tracks, sidecar_marks(Sidecars()),
+                      [], [], time.perf_counter() - started, str(exc))
+    try:
         pr = probe(ctx.tools, video)
     except (ProbeError, ToolError) as exc:
         return Result(video, "failed", EMPTY_PROBE.tracks, sidecar_marks(Sidecars()),
                       [], [], time.perf_counter() - started, f"视频无法解析：{brief_error(str(exc), video)}")
 
     side = find_sidecars(video)
-    plan = make_plan(video, pr, side)
+    plan = make_plan(video, pr, side, container)
     before = dict(pr.tracks)
     available = sidecar_marks(side)
 
@@ -841,7 +1037,7 @@ def process_video(ctx: "Context", video: Path) -> Result:
         note = plan.skip_reason
         deleted: list[Path] = []
         if not ctx.dry_run:
-            clean_stale_temps(video.parent, video.stem)   # 跳过也清残留，否则永远没人收拾
+            clean_stale_temps(video.parent, video.stem, container.suffix)   # 跳过也清残留，否则永远没人收拾
         if ctx.purge and not ctx.dry_run and not ctx.keep and side.paths():
             deleted = remove_files(ctx, side.paths())
             if deleted:
@@ -853,6 +1049,8 @@ def process_video(ctx: "Context", video: Path) -> Result:
     if ctx.dry_run:
         added = [name for name, path in plan.additions.items() if path]
         note = "将并入 " + "+".join(added)
+        if plan.dropped_subtitles:
+            note += f"；原图形字幕（{'/'.join(sorted(set(plan.dropped_subtitles)))}）无法放入 MP4，将丢弃"
         if plan.add_sub and plan.add_sub.suffix.lower() == ".json":
             try:
                 note += f"（字幕 {len(load_cues(plan.add_sub))} 条）"
@@ -864,11 +1062,13 @@ def process_video(ctx: "Context", video: Path) -> Result:
         return Result(video, "planned", before, available, added, missing,
                       time.perf_counter() - started, note)
 
-    clean_stale_temps(video.parent, video.stem)
+    clean_stale_temps(video.parent, video.stem, container.suffix)
     workdir = Path(tempfile.mkdtemp(prefix="mergevid_"))
-    dest = video.with_name(f".{video.stem}.mergetmp.{os.getpid()}.mp4")
+    dest = video.with_name(f".{video.stem}.mergetmp.{os.getpid()}{container.suffix}")
     temporary: list[Path] = [dest]
     warnings: list[str] = []
+    if plan.dropped_subtitles:
+        warnings.append(f"原图形字幕（{'/'.join(sorted(set(plan.dropped_subtitles)))}）无法放入 MP4，已丢弃")
 
     try:
         subtitle: Optional[Path] = None
@@ -891,13 +1091,23 @@ def process_video(ctx: "Context", video: Path) -> Result:
                 warnings.append(f"封面未并入（{exc}）")
                 plan.add_cover = None
 
+        attachments: list[Attachment] = []
+        if container.cover_mode == "attachment" and plan.probe.has_cover:
+            try:
+                attachments, tmp_covers = extract_covers(ctx.tools, video, plan.probe, workdir)
+                temporary.extend(tmp_covers)
+            except (ValueError, OSError) as exc:
+                warnings.append(f"原有封面未能保留（{exc}）")
+                plan.covers_kept = False
+
         if not plan.has_work:
             return Result(video, "skipped", before, available, [],
                           [name for name, ok in before.items() if not ok],
                           time.perf_counter() - started,
                           warnings_note(warnings) or "没有可并入的内容")
 
-        cmd = build_command(ctx.tools, plan, subtitle, cover, dest, ctx.with_title, ctx.sub_lang)
+        cmd = build_command(ctx.tools, plan, subtitle, cover, dest, ctx.with_title,
+                            ctx.sub_lang, attachments)
         proc = run_command(cmd, FFMPEG_TIMEOUT)
         if proc.returncode != 0:
             return Result(video, "failed", before, available, [], [],
@@ -1139,7 +1349,7 @@ def render_summary(results: Sequence[Result], orphans: dict[Path, list[Path]], d
             lines.append(f"  · {r.video.name} — {r.note}")
 
     if orphans:
-        lines.append("孤立附件（没有同名 mp4，未处理）：")
+        lines.append("孤立附件（没有同名视频，未处理）：")
         for directory, items in orphans.items():
             for item in items:
                 lines.append(f"  · {item.name}    [{directory}]")
@@ -1173,7 +1383,7 @@ def collect_videos(paths: Sequence[Path], recursive: bool = False) -> list[Path]
         elif path.is_file() and path.suffix.lower() in VIDEO_EXTS:
             found.append(path)
         else:
-            raise ValueError(f"不是目录也不是 mp4：{path}")
+            raise ValueError(f"不是目录也不是支持的视频文件（{'/'.join(VIDEO_EXTS)}）：{path}")
 
     unique: list[Path] = []
     seen: set[str] = set()
@@ -1207,7 +1417,7 @@ def find_orphans(directories: Iterable[Path], videos: Sequence[Path]) -> dict[Pa
 def run(paths: Sequence[Path], ctx: Context, jobs: int, recursive: bool = False) -> int:
     videos = collect_videos(paths, recursive)
     if not videos:
-        ctx.log("没有找到 *.mp4。")
+        ctx.log(f"没有找到可处理的视频文件（{'/'.join(VIDEO_EXTS)}）。")
         return 0
 
     ctx.log(f"== merge_videos {VERSION} ==")
@@ -1288,7 +1498,7 @@ def emit_hint(code: str) -> None:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="merge_videos.py",
-        description="批量合并视频与同名音频、字幕、封面，补齐视频缺的轨道。",
+        description="批量合并视频与同名音频、字幕、封面（.mp4/.m4v/.mkv），补齐视频缺的轨道。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
@@ -1297,7 +1507,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "  merge_videos.py -j 4 .                 4 个文件并行\n"
         ),
     )
-    parser.add_argument("paths", nargs="*", help="目录或单个 mp4；留空表示脚本所在目录")
+    parser.add_argument("paths", nargs="*", help="目录或单个视频（.mp4/.m4v/.mkv）；留空表示脚本所在目录")
     parser.add_argument("-n", "--dry-run", action="store_true", help="只分析，不写文件")
     parser.add_argument("-k", "--keep", action="store_true", help="保留全部源文件")
     parser.add_argument("-p", "--purge", action="store_true", help="连未使用的侧车一起删")
