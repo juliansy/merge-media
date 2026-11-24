@@ -856,7 +856,12 @@ def validate_image(tools: Tools, image: Path) -> None:
     ]
     proc = run_command(cmd, FFPROBE_TIMEOUT)
     if proc.returncode != 0:
-        raise ValueError(f"封面无法解码：{brief_error(decode(proc.stderr), image)}")
+        detail = brief_error(decode(proc.stderr), image)
+        # ffmpeg 对坏图常只回一句 "Nothing was written..." / "return code ..."，
+        # 对用户没有指导意义，换成能照着做的说法。
+        if not detail or "Nothing was written" in detail or "return code" in detail:
+            detail = "文件可能已损坏，或不是有效的图片"
+        raise ValueError(f"封面无法解码：{detail}；请换一张 JPG/PNG 后重试")
 
 
 def prepare_cover(tools: Tools, cover: Path, workdir: Path) -> tuple[Path, Optional[Path]]:
@@ -1247,16 +1252,16 @@ def process_video(ctx: "Context", video: Path) -> Result:
     before = dict(pr.tracks)
     available = sidecar_marks(side)
 
-    # 音频侧车能不能直接 copy 进目标容器，在 plan 阶段就判定（dry-run 也能看见）。
+    # 音频侧车先探测：文件损坏在 plan 阶段就降级；编码不合容器也在 dry-run 就说明。
     audio_problem = ""
-    if plan.add_audio and container.audio_codecs:
+    if plan.add_audio:
         try:
             codec = probe_audio_codec(ctx.tools, plan.add_audio)
         except (ProbeError, ToolError) as exc:
-            audio_problem = f"音频未并入（{brief_error(str(exc), plan.add_audio)}）"
+            audio_problem = f"音频未并入（{plan.add_audio.name}：{brief_error(str(exc), plan.add_audio)}）"
             plan.add_audio = None
         else:
-            if codec not in container.audio_codecs:
+            if container.audio_codecs and codec not in container.audio_codecs:
                 audio_problem = (
                     f"音频未并入（{codec} 不适合放进 {container.suffix} 容器；"
                     f"可改用 .mkv，或先把音频转成 AAC/MP3）"
@@ -1277,20 +1282,43 @@ def process_video(ctx: "Context", video: Path) -> Result:
                       time.perf_counter() - started, note, deleted)
 
     if ctx.dry_run:
+        # 预演也真的做一遍“预处理”：字幕编码/时间轴、封面能否解码、AVIF 解码器是否可用。
+        # 只写系统临时目录，不碰目标目录；这样“预演说能并、真跑却说不能”的分支会提前暴露。
+        dry_workdir = Path(tempfile.mkdtemp(prefix="mergevid_dry_"))
+        degraded: list[str] = []
+        json_counts: list[str] = []
+        cover_name = plan.add_cover.name if plan.add_cover else ""
+        try:
+            if plan.add_cover:
+                try:
+                    prepare_cover(ctx.tools, plan.add_cover, dry_workdir)
+                except (ValueError, OSError) as exc:
+                    plan.add_cover = None
+                    degraded.append(f"封面未并入（{cover_name}：{exc}）")
+            kept: list[Subtitle] = []
+            for entry in plan.add_subs:
+                try:
+                    prepare_subtitle(ctx.tools, entry.path, dry_workdir)
+                except (ValueError, OSError) as exc:
+                    degraded.append(f"字幕未并入（{entry.path.name}：{exc}）")
+                    continue
+                if entry.path.suffix.lower() == ".json":
+                    try:
+                        json_counts.append(f"（{entry.path.name} {len(load_cues(entry.path))} 条）")
+                    except (ValueError, OSError):
+                        pass
+                kept.append(entry)
+            plan.add_subs = tuple(kept)
+        finally:
+            shutil.rmtree(dry_workdir, ignore_errors=True)
+
         added = [name for name, path in plan.additions.items() if path]
         note = ("将并入 " + "+".join(added)) if added else "没有可并入的内容"
+        note += "".join(json_counts)
         if plan.dropped_subtitles:
             note += f"；原图形字幕（{'/'.join(sorted(set(plan.dropped_subtitles)))}）无法放入 MP4，将丢弃"
-        for entry in plan.add_subs:
-            if entry.path.suffix.lower() != ".json":
-                continue
-            try:
-                note += f"（{entry.path.name} {len(load_cues(entry.path))} 条）"
-            except (ValueError, OSError) as exc:
-                plan.add_subs = tuple(sub for sub in plan.add_subs if sub != entry)
-                if not plan.add_subs:
-                    added = [name for name in added if name != TRACK_SUB]
-                note = f"预演：字幕 {entry.path.name} 无法读取（{exc}），其余将并入 " + ("+".join(added) or "无")
+        for problem in degraded:
+            note += "；" + problem
         if audio_problem:
             note += "；" + audio_problem
         missing = [name for name, ok in plan.expected_tracks().items() if not ok and name not in added]
@@ -1338,7 +1366,7 @@ def process_video(ctx: "Context", video: Path) -> Result:
                 if tmp:
                     temporary.append(tmp)
             except (ValueError, OSError) as exc:
-                warnings.append(f"封面未并入（{exc}）")
+                warnings.append(f"封面未并入（{plan.add_cover.name}：{exc}）")
                 plan.add_cover = None
 
         attachments: list[Attachment] = []
