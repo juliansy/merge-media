@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -149,6 +150,39 @@ class Tools:
                 "或用 --ffmpeg / --ffprobe 指定路径。"
             )
         return cls(ff, fp)
+
+    @lru_cache(maxsize=None)
+    def decoders(self) -> frozenset[str]:
+        """ffmpeg 编译进来的解码器名（整个进程只跑一次 -decoders）。"""
+        proc = run_command([self.ffmpeg, "-hide_banner", "-decoders"], FFPROBE_TIMEOUT)
+        if proc.returncode != 0:
+            return frozenset()
+        names: set[str] = set()
+        for line in decode(proc.stdout).splitlines():
+            match = re.match(r"^\s*[VAS][A-Z.]{5}\s+(\S+)", line)
+            if match:
+                names.add(match.group(1))
+        return frozenset(names)
+
+    @lru_cache(maxsize=None)
+    def muxers(self) -> frozenset[str]:
+        """ffmpeg 编译进来的封装器名（整个进程只跑一次 -muxers）。"""
+        proc = run_command([self.ffmpeg, "-hide_banner", "-muxers"], FFPROBE_TIMEOUT)
+        if proc.returncode != 0:
+            return frozenset()
+        names: set[str] = set()
+        for line in decode(proc.stdout).splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in ("E", "D", "E.", "D."):
+                names.add(parts[1])
+        return frozenset(names)
+
+    def has_decoder(self, *names: str) -> bool:
+        available = self.decoders()
+        return any(name in available for name in names)
+
+    def has_muxer(self, name: str) -> bool:
+        return name in self.muxers()
 
 
 def run_command(cmd: Sequence[str], timeout: int) -> subprocess.CompletedProcess:
@@ -774,14 +808,20 @@ def _has_subtitle_text(text: str, suffix: str = "") -> bool:
     return False
 
 
+def _temp_token(path: Path) -> str:
+    """给每个源文件一个稳定的短哈希，避免多个待转换字幕在临时目录里互相覆盖。"""
+    return hashlib.sha1(str(path).encode("utf-8", "replace")).hexdigest()[:8]
+
+
 def prepare_subtitle(tools: Tools, subtitle: Path, workdir: Path) -> tuple[Path, Optional[Path]]:
     """返回 (给 ffmpeg 用的字幕路径, 需要额外清理的临时文件)。
 
     ffmpeg 按 UTF-8 读文本字幕，GBK 的 .srt/.vtt 会乱码，所以先探测编码，
     需要时转存成临时 UTF-8 文件；.json 则整份转成 SRT。
     """
+    token = _temp_token(subtitle)
     if subtitle.suffix.lower() == ".json":
-        target = workdir / "subtitle.srt"
+        target = workdir / f"sub_{token}.srt"
         count = json_to_srt(subtitle, target)
         if count <= 0:
             raise ValueError("JSON 字幕转换后为空")
@@ -802,14 +842,31 @@ def prepare_subtitle(tools: Tools, subtitle: Path, workdir: Path) -> tuple[Path,
         ensure_playable(subtitle, subtitle.suffix)
         return subtitle, None                    # 本来就是 UTF-8，直接用原文件
 
-    target = workdir / ("subtitle" + subtitle.suffix.lower())
+    target = workdir / f"sub_{token}{subtitle.suffix.lower()}"
     target.write_text(text.replace("\r\n", "\n"), encoding="utf-8", newline="\n")
     ensure_playable(target, subtitle.suffix)
     return target, target
 
 
+def validate_image(tools: Tools, image: Path) -> None:
+    """真正解码一帧：坏 JPEG / 截断 PNG 在这里就降级，而不是让最终 mux 整单失败。"""
+    cmd = [
+        tools.ffmpeg, "-hide_banner", "-nostdin", "-v", "error",
+        "-i", str(image), "-frames:v", "1", "-f", "null", "-",
+    ]
+    proc = run_command(cmd, FFPROBE_TIMEOUT)
+    if proc.returncode != 0:
+        raise ValueError(f"封面无法解码：{brief_error(decode(proc.stderr), image)}")
+
+
 def prepare_cover(tools: Tools, cover: Path, workdir: Path) -> tuple[Path, Optional[Path]]:
     """封面统一转成 mjpeg 临时 JPEG：mp4 的 attached_pic 与 mkv 的 -attach 都用它。"""
+    if cover.suffix.lower() == ".avif" and not tools.has_decoder("av1", "libdav1d"):
+        raise ValueError(
+            "AVIF 封面需要 ffmpeg 的 AV1 解码器；当前 ffmpeg 不带（精简版常见），"
+            "请换 full 版 ffmpeg，或先把封面转成 JPG/PNG"
+        )
+    validate_image(tools, cover)                # 坏图先降级，不拖垮整单
     if cover.suffix.lower() in JPEG_EXTS:
         return cover, None
     target = workdir / "cover.jpg"
@@ -821,7 +878,8 @@ def prepare_cover(tools: Tools, cover: Path, workdir: Path) -> tuple[Path, Optio
     ]
     proc = run_command(cmd, FFPROBE_TIMEOUT)
     if proc.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
-        raise ValueError(f"封面转换失败：{one_line(decode(proc.stderr))}")
+        raise ValueError(f"封面转换失败：{brief_error(decode(proc.stderr), cover)}")
+    validate_image(tools, target)               # 转换产物也必须能解码
     return target, target
 
 
