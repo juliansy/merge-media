@@ -3,15 +3,16 @@
 """merge_videos.py -- 把分离的视频、音频、字幕和封面封装成一个文件。
 
 扫描目录里的 .mp4/.m4v/.mkv，用 ffprobe 读出视频**已有**的音轨 / 字幕 / 封面，
-再找同名的侧车文件（音频 .m4a/.aac/.mp3/.opus/.flac/.ogg/.wav，字幕
+再找同名的侧车文件（音频 .m4a/.aac/.mp3/.opus/.flac/.ogg/.wav/.webm/.weba，字幕
 .ass/.ssa/.srt/.json/.vtt，封面 .jpg/.jpeg/.png/.webp/.avif/.bmp/.gif/.tif/.tiff），
 只补“视频缺、目录有”的部分，一次 ffmpeg 调用完成封装；产物校验通过后原子替换
-原视频，任何一步失败都原样保留所有源文件。
+原视频，任何一步失败都原样保留所有源文件。MP4 装不下某个流时改写成同名 .mkv，
+所有流仍然 copy，不转码。
 
 同名字幕与“同名 + 语言后缀”的字幕（x.en.vtt / x.zh-Hans.srt / x_zh.json）都会发现，
 一次可并入多条不同语言（同名文件有多种格式时只取优先级最高的一种）。容器差异集中在
 CONTAINERS：MP4 字幕转 mov_text、封面写 attached_pic、音频只收 AAC/MP3/AC3/E-AC3/ALAC；
-Matroska 字幕与音频原样 copy、封面写成附件。.mov 不支持（mov muxer 会静默丢弃封面）。
+装不下时整体改用 Matroska（字幕与音频原样 copy、封面写成附件）。.mov 不支持。
 
 命令行见 `-h`；退出码 0 = 全部成功或无需处理，1 = 有文件失败，2 = 参数或环境错误。
 """
@@ -36,7 +37,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 AUDIO_EXTS = (".m4a", ".aac", ".mp3", ".opus", ".flac", ".ogg", ".wav", ".webm", ".weba")
 # 入口白名单 = ffmpeg 能当文本/图形字幕读出来的格式；.ssa/.ass 是同一套解析器，成对放行。
@@ -57,8 +58,6 @@ TRACK_SUB = "字幕"
 TRACK_COVER = "封面"
 MARK_SHORT = {TRACK_AUDIO: "音", TRACK_SUB: "字", TRACK_COVER: "封"}
 BITMAP_SUB_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"})
-# WebM 音频（通常是 Opus/Vorbis）放不进 MP4 时转成 AAC；MKV 仍原样 copy。
-TRANSCODE_AUDIO = frozenset({"opus", "vorbis"})
 # .webm/.weba 可能本来就是同名视频的另一份下载，--purge 不删它们。
 AMBIGUOUS_AUDIO_EXTS = (".webm", ".weba")
 
@@ -708,7 +707,6 @@ class Plan:
     kept_subs: tuple[SubStream, ...] = ()   # 已有字幕里会写进产物的（MP4 下图像字幕被剔除）
     dropped_subs: tuple[str, ...] = ()      # 被剔除的图像字幕编码
     covers_kept: bool = True                # mkv 原有封面提取失败时置 False，避免校验误报
-    transcode_audio: bool = False           # Opus/Vorbis 进 MP4 时转 AAC
     keep_audio_source: bool = False         # 同名 webm 里还有视频时，合并后保留它
 
     @property
@@ -810,11 +808,7 @@ def build_command(tools: Tools, plan: Plan, subtitles: Sequence[SubtitleInput],
     for item in maps:
         cmd += ["-map", item]
 
-    cmd += ["-c:v", "copy"]
-    if plan.transcode_audio:
-        cmd += ["-c:a", "aac", "-b:a", "192k"]
-    else:
-        cmd += ["-c:a", "copy"]
+    cmd += ["-c:v", "copy", "-c:a", "copy"]
     if plan.kept_subs or subtitles:
         cmd += ["-c:s", container.subtitle_codec]
     for offset, sub in enumerate(subtitles):
@@ -964,10 +958,27 @@ def prepare_assets(tools: Tools, plan: Plan, workdir: Path, sub_lang: str) -> As
     return assets
 
 
+def choose_container(base: Container, pr: Probe, audio: str) -> tuple[Container, list[str]]:
+    """MP4 装不下的流改走 MKV，绝不转码。
+
+    返回 (实际容器, 说明)；没有冲突时说明为空。
+    """
+    if base.kind != "mp4":
+        return base, []
+    reasons: list[str] = []
+    if any(sub.codec in BITMAP_SUB_CODECS for sub in pr.subtitles):
+        reasons.append("图像字幕")
+    if audio and audio not in base.audio_codecs:
+        reasons.append(f"{audio} 音频")
+    if not reasons:
+        return base, []
+    return CONTAINERS[".mkv"], [f"MP4 装不下 {'、'.join(reasons)}，改用 MKV 输出（不转码）"]
+
+
 def process_video(ctx: "Context", video: Path) -> Result:
     started = time.perf_counter()
     try:
-        container = container_for(video)
+        base = container_for(video)
     except ValueError as exc:
         return _failed(video, started, str(exc))
     try:
@@ -976,31 +987,28 @@ def process_video(ctx: "Context", video: Path) -> Result:
         return _failed(video, started, f"视频无法解析：{brief_error(str(exc), video)}")
 
     side = find_sidecars(build_index(video.parent), video)
-    plan = make_plan(video, pr, side, container)
     before, available = pr.tracks, sidecar_marks(side)
     warnings: list[str] = []
+    audio_codec_name = ""
+    keep_audio_source = False
 
-    # 音频侧车先探测：文件损坏在计划阶段就降级；编码不合容器在 dry-run 就说明。
-    if plan.add_audio:
+    if side.audio and not pr.has_audio:
+        audio_path = side.audio
         try:
-            codec, has_video = audio_codec(ctx.tools, plan.add_audio)
+            audio_codec_name, has_video = audio_codec(ctx.tools, audio_path)
         except (ProbeError, ToolError) as exc:
-            warnings.append(f"音频未并入（{plan.add_audio.name}：{brief_error(str(exc), plan.add_audio)}）")
-            plan.add_audio = None
+            warnings.append(f"音频未并入（{audio_path.name}：{brief_error(str(exc), audio_path)}）")
+            side = Sidecars(None, side.subtitles, side.cover)
         else:
-            if container.audio_codecs and codec not in container.audio_codecs:
-                if codec in TRANSCODE_AUDIO:
-                    plan.transcode_audio = True
-                    warnings.append(f"音频转码为 AAC（{codec} 不能直接放进 {container.suffix} 容器）")
-                else:
-                    warnings.append(
-                        f"音频未并入（{codec} 不适合放进 {container.suffix} 容器；"
-                        f"可改用 .mkv，或先把音频转成 AAC/MP3）"
-                    )
-                    plan.add_audio = None
-            if has_video and plan.add_audio and plan.add_audio.suffix.lower() in AMBIGUOUS_AUDIO_EXTS:
-                plan.keep_audio_source = True
-                warnings.append(f"同名 {plan.add_audio.suffix} 里还有视频轨，合并后保留该文件")
+            if has_video and audio_path.suffix.lower() in AMBIGUOUS_AUDIO_EXTS:
+                keep_audio_source = True
+                warnings.append(f"同名 {audio_path.suffix} 里还有视频轨，合并后保留该文件")
+
+    container, container_notes = choose_container(base, pr, audio_codec_name)
+    warnings += container_notes
+    plan = make_plan(video, pr, side, container)
+    plan.keep_audio_source = keep_audio_source
+    target = video if video.suffix.lower() == container.suffix else video.with_suffix(container.suffix)
 
     if plan.skip_reason:
         deleted: list[Path] = []
@@ -1017,6 +1025,9 @@ def process_video(ctx: "Context", video: Path) -> Result:
         missing = [name for name, ok in before.items() if not ok]
         return Result(video, "skipped", before, available, [], missing,
                       time.perf_counter() - started, note, deleted)
+
+    if target != video and target.exists():
+        return _failed(video, started, f"目标已存在：{target.name}；请先移走它", before, available)
 
     workdir = Path(tempfile.mkdtemp(prefix="mergevid_dry_" if ctx.dry_run else "mergevid_"))
     dest = video.with_name(f".{video.stem}.mergetmp.{os.getpid()}{container.suffix}")
@@ -1036,6 +1047,8 @@ def process_video(ctx: "Context", video: Path) -> Result:
 
         if ctx.dry_run:
             note = _dry_note(plan, assets, added, warnings)
+            if target != video:
+                note += f"；输出 {target.name}"
             expected = expected_tracks(plan, assets)
             missing = [name for name, ok in expected.items() if not ok and name not in added]
             return Result(video, "planned", before, available, added, missing,
@@ -1057,14 +1070,22 @@ def process_video(ctx: "Context", video: Path) -> Result:
                            _with_warnings("产物校验失败：" + "，".join(problems), warnings),
                            before, available)
 
-        os.replace(dest, video)                     # 同目录替换，原子
+        os.replace(dest, target)                    # 同目录替换，原子
         deleted = [] if ctx.keep else delete_sources(ctx, plan, assets, added)
+        if target != video and not ctx.keep:
+            try:
+                video.unlink()
+                deleted.append(video)
+            except OSError as exc:
+                warnings.append(f"源视频未删除（{exc}）")
         missing = [name for name, ok in expected_tracks(plan, assets).items() if not ok]
-        note = "；".join(warnings)
+        notes = list(warnings)
+        if target != video:
+            notes.append(f"输出 {target.name}（未转码）")
         if deleted:
-            note = (note + "；" if note else "") + f"删除 {len(deleted)} 个源文件"
-        return Result(video, "merged", before, available, added, missing,
-                      time.perf_counter() - started, note, deleted)
+            notes.append(f"删除 {len(deleted)} 个源文件")
+        return Result(target, "merged", before, available, added, missing,
+                      time.perf_counter() - started, "；".join(notes), deleted)
     except (ValueError, ToolError) as exc:
         return _failed(video, started, _with_warnings(str(exc), warnings), before, available)
     except OSError as exc:

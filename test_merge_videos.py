@@ -312,6 +312,32 @@ class ContainerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mv.container_for(Path("a.mov"))
 
+    def test_mp4_switches_to_mkv_for_opus_audio(self) -> None:
+        base = mv.container_for(Path("x.mp4"))
+        container, notes = mv.choose_container(base, mv.Probe(main_index=0), "opus")
+        self.assertEqual(container.suffix, ".mkv")
+        self.assertTrue(any("opus" in note and "MKV" in note for note in notes))
+
+    def test_mp4_switches_to_mkv_for_bitmap_subtitles(self) -> None:
+        base = mv.container_for(Path("x.mp4"))
+        probe = mv.Probe(main_index=0, subtitles=(mv.SubStream(1, "hdmv_pgs_subtitle", "eng"),))
+        container, notes = mv.choose_container(base, probe, "aac")
+        self.assertEqual(container.suffix, ".mkv")
+        self.assertTrue(any("图像字幕" in note for note in notes))
+
+    def test_mp4_stays_mp4_when_everything_fits(self) -> None:
+        base = mv.container_for(Path("x.mp4"))
+        container, notes = mv.choose_container(base, mv.Probe(main_index=0), "aac")
+        self.assertEqual(container, base)
+        self.assertEqual(notes, [])
+
+    def test_mkv_never_switches(self) -> None:
+        base = mv.container_for(Path("x.mkv"))
+        probe = mv.Probe(main_index=0, subtitles=(mv.SubStream(1, "hdmv_pgs_subtitle", "eng"),))
+        container, notes = mv.choose_container(base, probe, "opus")
+        self.assertEqual(container, base)
+        self.assertEqual(notes, [])
+
 
 class BuildCommandTests(unittest.TestCase):
     """命令拼装里最容易悄悄丢轨：已有轨道必须显式 -map，封面输出顺序必须对。"""
@@ -354,14 +380,13 @@ class BuildCommandTests(unittest.TestCase):
         self.assertIn(f"-attach {Path('work/new.jpg')} -metadata:s:t:2 filename=cover.jpg", text)
         self.assertIn("-c:s copy", text)
 
-    def test_webm_audio_is_transcoded_for_mp4(self) -> None:
-        plan = mv.make_plan(Path("x.mp4"), mv.Probe(main_index=0),
-                            mv.Sidecars(audio=Path("x.webm")), mv.container_for(Path("x.mp4")))
-        plan.transcode_audio = True
-        cmd = mv.build_command(self.tools, plan, (), None, Path("out.mp4"), with_title=False)
+    def test_mkv_copies_audio_without_transcoding(self) -> None:
+        plan = mv.make_plan(Path("x.mkv"), mv.Probe(main_index=0),
+                            mv.Sidecars(audio=Path("x.webm")), mv.container_for(Path("x.mkv")))
+        cmd = mv.build_command(self.tools, plan, (), None, Path("out.mkv"), with_title=False)
         text = " ".join(cmd)
-        self.assertIn("-c:a aac -b:a 192k", text)
-        self.assertNotIn("-c:a copy", text)
+        self.assertIn("-c:a copy", text)
+        self.assertNotIn("aac", text)
 
     def test_expected_tracks_reflects_degraded_assets(self) -> None:
         probe = mv.Probe(main_index=0)

@@ -21,14 +21,14 @@
 
 # Merge Audio and Video
 
-This tool is for a download that finished without being assembled: one file holds the picture, another holds the sound, and the subtitles and cover art sit beside them. Put `merge_videos.py` and `merge.bat` into that folder and run it — you get one video (`.mp4`, `.m4v` or `.mkv`) with all of them inside. Video is copied as it is; audio is copied too unless the container cannot carry its codec (Opus/Vorbis going into MP4 is transcoded to AAC).
+This tool is for a download that finished without being assembled: one file holds the picture, another holds the sound, and the subtitles and cover art sit beside them. Put `merge_videos.py` and `merge.bat` into that folder and run it — you get one video (`.mp4`, `.m4v` or `.mkv`) with all of them inside. Video is copied as it is, and audio, subtitles and cover are copied too. If the `.mp4`/`.m4v` container cannot carry a stream (Opus/Vorbis/FLAC audio, image subtitles), the result is written as `.mkv` instead, still without re-encoding.
 
 **Download:** [latest release](https://github.com/juliansy/merge-media/releases/latest) — a zip with `merge_videos.py`, `merge.bat`, both READMEs, the changelog and the license.
 
 ## What it does
 
-- Merges `name.mp4` and `name.m4a` into one file, keeping the video's container (`.mp4`/`.m4v`/`.mkv`).
-- Audio sidecars: `.m4a`, `.aac`, `.mp3`, `.opus`, `.flac`, `.ogg`, `.wav`, `.webm`, `.weba`. MP4 copies AAC/MP3/AC3/E-AC3/ALAC and transcodes Opus/Vorbis (the usual `.webm` audio) to 192 kbps AAC; other codecs are skipped with a note (use `.mkv`, or convert the audio), while the rest of the merge continues.
+- Merges `name.mp4` and `name.m4a` into one file, keeping the video's container (`.mp4`/`.m4v`/`.mkv`) when it can hold every stream.
+- Audio sidecars: `.m4a`, `.aac`, `.mp3`, `.opus`, `.flac`, `.ogg`, `.wav`, `.webm`, `.weba`. MP4 copies AAC/MP3/AC3/E-AC3/ALAC. If the audio is a codec MP4 cannot carry (Opus/Vorbis from `.webm`, FLAC, ...), the result switches to `.mkv` and the audio is copied as it is — nothing is transcoded or dropped.
 - Embeds subtitles: `.json` (Bilibili subtitle export), `.ass`, `.ssa`, `.srt`, `.vtt` — the plain same-name file (if several same-name formats exist, the first by priority `.ass`, `.ssa`, `.srt`, `.json`, `.vtt` wins) plus any number of language-suffixed files (`name.en.vtt`, `name.zh-Hans.srt`, `name_zh.json`). Each becomes its own track, tagged with the language from its suffix.
 - Attaches a cover: `.jpg`, `.jpeg`, `.png`, `.webp`, `.avif`, `.bmp`, `.gif`, `.tif`, `.tiff`; anything that is not JPEG is converted first. AVIF needs an ffmpeg with an AV1 decoder (the "full" build).
 - Adds only what is missing: audio, subtitles and cover already inside the video stay untouched. A sidecar whose language already exists is skipped instead of duplicated.
@@ -130,14 +130,14 @@ The console output is in Chinese. Read the columns left to right: what the video
 
 - Source files are never edited in place. The result is written to a temp file, checked, then swapped in.
 - If one file fails, its sources stay exactly as they were; the exit code is `1`.
-- Sidecars are deleted only after a merge has been verified. `-p` also removes sidecars the video had no use for; a sidecar that failed to merge is always kept, and a `.webm`/`.weba` sidecar is never purged because it may be a second copy of the video. After a successful merge, a `.webm` that still contains a video track is kept too.
-- Opus/Vorbis audio going into MP4 is transcoded to 192 kbps AAC; everything else is copied. Target `.mkv` if you want to keep the original codec.
+- Sidecars are deleted only after a merge has been verified. `-p` also removes sidecars the video had no use for; a sidecar that failed to merge is always kept, and a `.webm`/`.weba` sidecar is never purged because it may be a second copy of the video. After a successful merge, a `.webm` that still contains a video track is kept too. When the output container changes, the original video is removed only after the new `.mkv` has been verified.
+- Audio is never re-encoded. If MP4 cannot carry the sidecar's codec, the output is written next to the source as `name.mkv` and the original `.mp4`/`.m4v` is removed after verification (`-k` keeps it).
 - Files that are already complete are skipped, never rewritten.
 
 ## Limitations
 
-- MP4 stores subtitles as `mov_text` (the subtitle format most mp4 players accept): text and timing survive, styling and positioning do not. MKV keeps the original subtitle codecs instead, so PGS/ASS/VobSub keep their styling.
-- MP4 audio accepts AAC/MP3/AC3/E-AC3/ALAC and transcodes Opus/Vorbis to AAC; FLAC and other codecs need MKV or a manual transcode. MKV accepts any codec.
+- MP4 stores text subtitles as `mov_text` (the subtitle format most mp4 players accept): text and timing survive, styling and positioning do not. MKV keeps the original subtitle codecs instead, so PGS/ASS/VobSub keep their styling. If the video has image subtitles that MP4 cannot carry, the output is written as MKV so they are kept.
+- MP4 audio accepts AAC/MP3/AC3/E-AC3/ALAC; any other codec (Opus/Vorbis/FLAC, ...) triggers the `.mkv` output. MKV accepts any codec.
 - `.mov` is not supported: ffmpeg's mov muxer silently drops attached cover art, so a merge would lose the cover. Remux to `.mp4`/`.m4v`/`.mkv` first.
 - AVIF covers need an ffmpeg with an AV1 decoder; without one the cover is skipped with a message and the other tracks still merge.
 - Paths longer than 260 characters can fail inside FFmpeg on older Windows builds.
