@@ -3,7 +3,8 @@
 """merge_videos.py -- 批量合并分离的视频、音频、字幕与封面。
 
 扫描目标目录里的 *.mp4，用 ffprobe 读出每个视频**已有**的音轨 / 字幕轨 / 封面，
-再在目录里找同名的侧车文件（.m4a/.aac/.mp3、.ass/.srt/.json/.vtt、.jpg/.jpeg/.png/.webp）。
+再在目录里找同名的侧车文件（.m4a/.aac/.mp3、.ass/.ssa/.srt/.json/.vtt、
+.jpg/.jpeg/.png/.webp/.avif/.bmp/.gif/.tif/.tiff）。
 只补“视频缺、目录有”的那一部分，一次 ffmpeg 调用完成封装，校验通过后原子替换原视频，
 失败则原样保留所有源文件。最后逐条汇报：哪个视频合并了、补了哪几轨、是否齐全。
 
@@ -51,8 +52,11 @@ from typing import Callable, Iterable, Iterator, Optional, Sequence
 VERSION = "1.4.1"
 
 AUDIO_EXTS = (".m4a", ".aac", ".mp3")
-SUB_EXTS = (".ass", ".srt", ".json", ".vtt")
-COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+# 入口白名单 = "ffmpeg 能当文本/图形字幕读出来"的格式；不在这里的后缀一律不发现。
+# .ssa 与 .ass 是同一套解析器，只是文件头版本不同（v4.00 vs v4.00+），必须成对放行。
+SUB_EXTS = (".ass", ".ssa", ".srt", ".json", ".vtt")
+# 封面只放 ffmpeg 常见可解码的静态图；HEIC / JXL 依赖编译选项，故意不放行。
+COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".gif", ".tif", ".tiff")
 JPEG_EXTS = (".jpg", ".jpeg")
 VIDEO_EXTS = (".mp4",)
 SIDECAR_EXTS = AUDIO_EXTS + SUB_EXTS + COVER_EXTS
@@ -396,6 +400,10 @@ def ensure_playable(path: Path, suffix: str) -> None:
             raise ValueError("ASS/SSA 字幕的 Dialogue 行没有文字")
     elif suffix == ".json":
         raise ValueError("JSON 字幕应当走转换流程")
+    else:
+        # 入口白名单已经过滤过一遍，这里再拒绝一次是纵深防御：
+        # 以后加字幕格式如果忘了补校验分支，至少不会把未知内容静默塞进 ffmpeg。
+        raise ValueError(f"不支持的字幕格式：{suffix or '(无扩展名)'}")
 
 
 def _has_subtitle_text(text: str, suffix: str = "") -> bool:
