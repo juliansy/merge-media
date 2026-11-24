@@ -21,30 +21,33 @@
 
 # Merge Audio and Video
 
-This tool is for a download that finished without being assembled: one file holds the picture, another holds the sound, and the subtitles and cover art sit beside them. Put `merge_videos.py` and `merge.bat` into that folder and run it — you get one `.mp4` with all of them inside. Video and audio are copied as they are, so nothing is re-encoded.
+This tool is for a download that finished without being assembled: one file holds the picture, another holds the sound, and the subtitles and cover art sit beside them. Put `merge_videos.py` and `merge.bat` into that folder and run it — you get one video (`.mp4`, `.m4v` or `.mkv`) with all of them inside. Video and audio are copied as they are, so nothing is re-encoded.
 
 **Download:** [latest release](https://github.com/juliansy/merge-media/releases/latest) — a zip with `merge_videos.py`, `merge.bat`, both READMEs and the license.
 
 ## What it does
 
-- Merges `name.mp4` and `name.m4a` into one `name.mp4`.
-- Embeds a same-name subtitle: `.json` (Bilibili subtitle export), `.ass`, `.srt` or `.vtt`.
-- Attaches a same-name cover: `.jpg`, `.jpeg`, `.png` or `.webp`; anything that is not JPEG is converted first.
-- Adds only what is missing: audio, subtitles and cover already inside the video stay untouched.
+- Merges `name.mp4` and `name.m4a` into one file, keeping the video's container (`.mp4`/`.m4v`/`.mkv`).
+- Audio sidecars: `.m4a`, `.aac`, `.mp3`, `.opus`, `.flac`, `.ogg`, `.wav`. MP4 only accepts AAC/MP3/AC3/E-AC3/ALAC; other codecs are skipped with a note (use `.mkv`, or convert the audio), while the rest of the merge continues.
+- Embeds subtitles: `.json` (Bilibili subtitle export), `.ass`, `.ssa`, `.srt`, `.vtt` — the plain same-name file plus any number of language-suffixed files (`name.en.vtt`, `name.zh-Hans.srt`, `name_zh.json`). Each becomes its own track, tagged with the language from its suffix.
+- Attaches a cover: `.jpg`, `.jpeg`, `.png`, `.webp`, `.avif`, `.bmp`, `.gif`, `.tif`, `.tiff`; anything that is not JPEG is converted first. AVIF needs an ffmpeg with an AV1 decoder (the "full" build).
+- Adds only what is missing: audio, subtitles and cover already inside the video stay untouched. A sidecar whose language already exists is skipped instead of duplicated.
 - Prints what it merged and whether the result is complete.
 
 ## What a folder looks like
 
-Put both script files into the folder. The media it picks up shares a name and differs only by extension.
+Put both script files into the folder. The media it picks up shares a name and differs only by extension; subtitle files may add a language suffix.
 
 ```text
 D:\Videos\
 ├── merge.bat           the launcher — double-click this
 ├── merge_videos.py     the script it runs — keep both together
 ├── lecture-01.mp4      the video (required)
-├── lecture-01.m4a      the audio (optional)
-├── lecture-01.json     subtitles (optional; .ass .srt .vtt also work)
-├── lecture-01.jpg      cover (optional; .jpeg .png .webp also work)
+├── lecture-01.m4a      the audio (optional; .aac .mp3 .opus .flac .ogg .wav)
+├── lecture-01.json     subtitles (optional; .ass .ssa .srt .vtt)
+├── lecture-01.en.vtt   same video, English track — the language suffix is optional
+├── lecture-01.zh-Hans.srt
+├── lecture-01.jpg      cover (optional; .jpeg .png .webp .avif .bmp .gif .tif .tiff)
 └── podcast-02.mp4      a second video, same run
 ```
 
@@ -85,7 +88,7 @@ Dropping things on the icon works too:
 | Action | Result |
 | --- | --- |
 | Drop a folder onto `merge.bat` | Merges that folder; add `-R` to include subfolders |
-| Drop a single `.mp4` onto `merge.bat` | Merges only that file |
+| Drop a single video file onto `merge.bat` | Merges only that file |
 
 ### Options
 
@@ -96,7 +99,7 @@ Dropping things on the icon works too:
 | `-p`, `--purge` | Also delete sidecars the video did not need |
 | `-j N` | Process N files at the same time |
 | `-R` | Include subfolders |
-| `--sub-lang LANG` | Language tag for added subtitles; `auto` by default |
+| `--sub-lang LANG` | Language tag for added subtitles without a language suffix; `auto` guesses from the text |
 | `-V` | Print the version |
 
 `python merge_videos.py -h` lists every option.
@@ -122,14 +125,24 @@ The console output is in Chinese. Read the columns left to right: what the video
 
 - Source files are never edited in place. The result is written to a temp file, checked, then swapped in.
 - If one file fails, its sources stay exactly as they were; the exit code is `1`.
-- Sidecars are deleted only after a merge has been verified. Use `-k` to keep them, `-n` to preview.
+- Sidecars are deleted only after a merge has been verified. `-p` also removes sidecars the video had no use for; a sidecar that failed to merge is always kept.
 - Files that are already complete are skipped, never rewritten.
 
 ## Limitations
 
-- Subtitles are stored as `mov_text`, the only subtitle format mp4 plays: text and timing survive, styling and positioning do not.
-- One new audio track and one new subtitle track per video; existing tracks are kept as they are.
+- MP4 stores subtitles as `mov_text` (the subtitle format most mp4 players accept): text and timing survive, styling and positioning do not. MKV keeps the original subtitle codecs instead, so PGS/ASS/VobSub keep their styling.
+- MP4 audio is limited to AAC/MP3/AC3/E-AC3/ALAC; other codecs need MKV or a transcode. MKV accepts any codec.
+- `.mov` is not supported: ffmpeg's mov muxer silently drops attached cover art, so a merge would lose the cover. Remux to `.mp4`/`.m4v`/`.mkv` first.
+- AVIF covers need an ffmpeg with an AV1 decoder; without one the cover is skipped with a message and the other tracks still merge.
 - Paths longer than 260 characters can fail inside FFmpeg on older Windows builds.
+
+## Tests
+
+The pure helpers (timestamps, subtitle parsing, language tags, sidecar discovery) have unit tests that need no ffmpeg:
+
+```text
+python -m unittest test_merge_videos -v
+```
 
 ## License
 
