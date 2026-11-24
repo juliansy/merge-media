@@ -277,7 +277,6 @@ class Probe:
     sub_streams: tuple[SubStream, ...] = ()
     cover_streams: tuple[CoverStream, ...] = ()
     attachment_count: int = 0          # matroska 的字体等附件数量（-map 0:t 用）
-    sub_duration: float = 0.0          # 字幕轨自身的时长，0 表示"有轨但没内容"
 
     @property
     def tracks(self) -> dict[str, bool]:
@@ -383,7 +382,6 @@ def probe(tools: Tools, path: Path) -> Probe:
         sub_streams=sub_streams,
         cover_streams=cover_streams,
         attachment_count=attachment_count,
-        sub_duration=stream_duration(subs[0] if subs else None),
     )
 
 
