@@ -3,6 +3,16 @@
 Downloadable builds live on the [releases page](https://github.com/juliansy/merge-media/releases).
 Tags before v1.7.0 predate this file; their notes are on that page.
 
+## v1.7.1 — 2026-11-25
+
+- `.webm` and `.weba` audio sidecars are discovered. Opus/Vorbis from them is
+  transcoded to 192 kbps AAC when the target is MP4; MKV still copies the
+  original codec.
+- `--purge` never removes a `.webm`/`.weba` sidecar, because it may be a second
+  copy of the same video rather than a lone audio track. If the `.webm` itself
+  contains a video track, it is kept after a successful merge as well.
+- FLAC and other codecs the MP4 whitelist rejects are still skipped with a note.
+
 ## v1.7.0 — 2026-11-25
 
 Refactor release. The merged output is unchanged for the cases the tool already

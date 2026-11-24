@@ -36,9 +36,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
-AUDIO_EXTS = (".m4a", ".aac", ".mp3", ".opus", ".flac", ".ogg", ".wav")
+AUDIO_EXTS = (".m4a", ".aac", ".mp3", ".opus", ".flac", ".ogg", ".wav", ".webm", ".weba")
 # 入口白名单 = ffmpeg 能当文本/图形字幕读出来的格式；.ssa/.ass 是同一套解析器，成对放行。
 SUB_EXTS = (".ass", ".ssa", ".srt", ".json", ".vtt")
 # 封面只放 ffmpeg 常见可解码的静态图；HEIC / JXL 依赖编译选项，故意不放行。
@@ -57,6 +57,10 @@ TRACK_SUB = "字幕"
 TRACK_COVER = "封面"
 MARK_SHORT = {TRACK_AUDIO: "音", TRACK_SUB: "字", TRACK_COVER: "封"}
 BITMAP_SUB_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"})
+# WebM 音频（通常是 Opus/Vorbis）放不进 MP4 时转成 AAC；MKV 仍原样 copy。
+TRANSCODE_AUDIO = frozenset({"opus", "vorbis"})
+# .webm/.weba 可能本来就是同名视频的另一份下载，--purge 不删它们。
+AMBIGUOUS_AUDIO_EXTS = (".webm", ".weba")
 
 
 @dataclass(frozen=True)
@@ -286,15 +290,21 @@ def probe(tools: Tools, path: Path) -> Probe:
     )
 
 
-def audio_codec(tools: Tools, path: Path) -> str:
-    """读侧车音频第一条音轨的编码名；文件损坏或没有音轨时抛 ProbeError。"""
+def audio_codec(tools: Tools, path: Path) -> tuple[str, bool]:
+    """读第一条音轨的编码名，以及文件里是否还有视频流。
+
+    同名 .webm 可能是整段视频而不是单独的音轨；有视频时合并后不要删它。
+    文件损坏或没有音轨时抛 ProbeError。
+    """
     streams = ffprobe_json(
-        tools, path, "-select_streams", "a:0", "-show_entries", "stream=codec_name"
+        tools, path, "-show_entries", "stream=codec_type,codec_name"
     ).get("streams") or []
-    codec = str(streams[0].get("codec_name") or "") if streams else ""
+    audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+    codec = str((audio or {}).get("codec_name") or "")
     if not codec:
         raise ProbeError("音频文件里没有可用的音轨")
-    return codec
+    has_video = any(stream.get("codec_type") == "video" for stream in streams)
+    return codec, has_video
 
 
 # --------------------------------------------------------------------------- #
@@ -698,6 +708,8 @@ class Plan:
     kept_subs: tuple[SubStream, ...] = ()   # 已有字幕里会写进产物的（MP4 下图像字幕被剔除）
     dropped_subs: tuple[str, ...] = ()      # 被剔除的图像字幕编码
     covers_kept: bool = True                # mkv 原有封面提取失败时置 False，避免校验误报
+    transcode_audio: bool = False           # Opus/Vorbis 进 MP4 时转 AAC
+    keep_audio_source: bool = False         # 同名 webm 里还有视频时，合并后保留它
 
     @property
     def has_work(self) -> bool:
@@ -798,7 +810,11 @@ def build_command(tools: Tools, plan: Plan, subtitles: Sequence[SubtitleInput],
     for item in maps:
         cmd += ["-map", item]
 
-    cmd += ["-c:v", "copy", "-c:a", "copy"]
+    cmd += ["-c:v", "copy"]
+    if plan.transcode_audio:
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
+    else:
+        cmd += ["-c:a", "copy"]
     if plan.kept_subs or subtitles:
         cmd += ["-c:s", container.subtitle_codec]
     for offset, sub in enumerate(subtitles):
@@ -967,24 +983,34 @@ def process_video(ctx: "Context", video: Path) -> Result:
     # 音频侧车先探测：文件损坏在计划阶段就降级；编码不合容器在 dry-run 就说明。
     if plan.add_audio:
         try:
-            codec = audio_codec(ctx.tools, plan.add_audio)
+            codec, has_video = audio_codec(ctx.tools, plan.add_audio)
         except (ProbeError, ToolError) as exc:
             warnings.append(f"音频未并入（{plan.add_audio.name}：{brief_error(str(exc), plan.add_audio)}）")
             plan.add_audio = None
         else:
             if container.audio_codecs and codec not in container.audio_codecs:
-                warnings.append(
-                    f"音频未并入（{codec} 不适合放进 {container.suffix} 容器；"
-                    f"可改用 .mkv，或先把音频转成 AAC/MP3）"
-                )
-                plan.add_audio = None
+                if codec in TRANSCODE_AUDIO:
+                    plan.transcode_audio = True
+                    warnings.append(f"音频转码为 AAC（{codec} 不能直接放进 {container.suffix} 容器）")
+                else:
+                    warnings.append(
+                        f"音频未并入（{codec} 不适合放进 {container.suffix} 容器；"
+                        f"可改用 .mkv，或先把音频转成 AAC/MP3）"
+                    )
+                    plan.add_audio = None
+            if has_video and plan.add_audio and plan.add_audio.suffix.lower() in AMBIGUOUS_AUDIO_EXTS:
+                plan.keep_audio_source = True
+                warnings.append(f"同名 {plan.add_audio.suffix} 里还有视频轨，合并后保留该文件")
 
     if plan.skip_reason:
         deleted: list[Path] = []
         if not ctx.dry_run:
             clean_stale_temps(video.parent, video.stem, container.suffix)   # 跳过也清残留
             if ctx.purge and not ctx.keep:
-                deleted = remove_files(ctx, side.paths())
+                # .webm/.weba 可能是另一份同名视频，不能当“未使用附件”删掉。
+                purgeable = [path for path in side.paths()
+                             if path.suffix.lower() not in AMBIGUOUS_AUDIO_EXTS]
+                deleted = remove_files(ctx, purgeable)
         note = plan.skip_reason
         if deleted:
             note += f"；清理 {len(deleted)} 个未使用附件"
@@ -1119,14 +1145,15 @@ def delete_sources(ctx: "Context", plan: Plan, assets: Assets, added: Sequence[s
     必须留下，否则用户丢的是唯一一份素材。
     """
     candidates: list[Path] = []
-    if plan.add_audio and TRACK_AUDIO in added:
+    if plan.add_audio and TRACK_AUDIO in added and not plan.keep_audio_source:
         candidates.append(plan.add_audio)
     if plan.add_cover and TRACK_COVER in added:
         candidates.append(plan.add_cover)
     candidates += [sub.source for sub in assets.subtitles]
 
     if ctx.purge:
-        if plan.side.audio and plan.add_audio is None and plan.probe.has_audio:
+        if (plan.side.audio and plan.add_audio is None and plan.probe.has_audio
+                and plan.side.audio.suffix.lower() not in AMBIGUOUS_AUDIO_EXTS):
             candidates.append(plan.side.audio)
         if plan.side.cover and plan.add_cover is None and plan.probe.has_cover:
             candidates.append(plan.side.cover)

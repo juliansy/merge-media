@@ -232,6 +232,13 @@ class SidecarDiscoveryTests(TempDirTestCase):
         self.assertEqual(side.audio.name, "movie.m4a")
         self.assertEqual(side.cover.name, "movie.jpg")
 
+    def test_webm_audio_is_discovered(self) -> None:
+        video = self.dir / "movie.mp4"
+        video.write_bytes(b"x")
+        self.write("movie.webm", "x")
+        side = mv.find_sidecars(mv.build_index(self.dir), video)
+        self.assertEqual(side.audio.name, "movie.webm")
+
     def test_empty_sidecar_is_ignored(self) -> None:
         video = self.dir / "movie.mp4"
         video.write_bytes(b"x")
@@ -346,6 +353,15 @@ class BuildCommandTests(unittest.TestCase):
         self.assertIn(f"-attach {Path('work/cover0.jpg')} -metadata:s:t:1 filename=cover.jpg", text)
         self.assertIn(f"-attach {Path('work/new.jpg')} -metadata:s:t:2 filename=cover.jpg", text)
         self.assertIn("-c:s copy", text)
+
+    def test_webm_audio_is_transcoded_for_mp4(self) -> None:
+        plan = mv.make_plan(Path("x.mp4"), mv.Probe(main_index=0),
+                            mv.Sidecars(audio=Path("x.webm")), mv.container_for(Path("x.mp4")))
+        plan.transcode_audio = True
+        cmd = mv.build_command(self.tools, plan, (), None, Path("out.mp4"), with_title=False)
+        text = " ".join(cmd)
+        self.assertIn("-c:a aac -b:a 192k", text)
+        self.assertNotIn("-c:a copy", text)
 
     def test_expected_tracks_reflects_degraded_assets(self) -> None:
         probe = mv.Probe(main_index=0)

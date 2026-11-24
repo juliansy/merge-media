@@ -21,14 +21,14 @@
 
 # 合并音频视频
 
-这个脚本针对的是一种情况：下载已经完成，但文件没有合并——画面在一个文件里，声音在另一个文件里，字幕和封面放在旁边。把 `merge_videos.py` 和 `merge.bat` 放进这个文件夹并运行，就能得到一个包含这些东西的视频文件（`.mp4`/`.m4v`/`.mkv`）。音视频按原样复制，不重新编码。
+这个脚本针对的是一种情况：下载已经完成，但文件没有合并——画面在一个文件里，声音在另一个文件里，字幕和封面放在旁边。把 `merge_videos.py` 和 `merge.bat` 放进这个文件夹并运行，就能得到一个包含这些东西的视频文件（`.mp4`/`.m4v`/`.mkv`）。画面按原样复制；音频也按原样复制，除非目标容器装不下它的编码（Opus/Vorbis 进 MP4 会转成 AAC）。
 
 **下载：**[最新版本](https://github.com/juliansy/merge-media/releases/latest)——压缩包里是 `merge_videos.py`、`merge.bat`、两份 README、更新日志和许可证。
 
 ## 它做什么
 
 - 把 `name.mp4` 与 `name.m4a` 合成一个文件，保持视频原来的容器（`.mp4`/`.m4v`/`.mkv`）。
-- 音频附件：`.m4a`、`.aac`、`.mp3`、`.opus`、`.flac`、`.ogg`、`.wav`。MP4 只接受 AAC/MP3/AC3/E-AC3/ALAC，其它编码会跳过并提示（改用 `.mkv` 或先转码），其余轨道照常合并。
+- 音频附件：`.m4a`、`.aac`、`.mp3`、`.opus`、`.flac`、`.ogg`、`.wav`、`.webm`、`.weba`。MP4 会复制 AAC/MP3/AC3/E-AC3/ALAC，并把 Opus/Vorbis（常见的 `.webm` 音频）转成 192 kbps AAC；其它编码仍会跳过并提示（改用 `.mkv` 或先转码），其余轨道照常合并。
 - 内嵌字幕：`.json`（B 站字幕导出）、`.ass`、`.ssa`、`.srt`、`.vtt`——同名文件（同时存在多种格式时按 `.ass`、`.ssa`、`.srt`、`.json`、`.vtt` 优先级取一个），以及任意多个带语言后缀的文件（`name.en.vtt`、`name.zh-Hans.srt`、`name_zh.json`）。每条各占一轨，语言取自后缀。
 - 内嵌封面：`.jpg`、`.jpeg`、`.png`、`.webp`、`.avif`、`.bmp`、`.gif`、`.tif`、`.tiff`；不是 JPEG 的会先转成 JPEG。AVIF 需要带 AV1 解码器的 ffmpeg（full 版）。
 - 只补缺的：视频里已有的音频、字幕、封面一律原样保留；已有同语言字幕时跳过对应附件，不重复添加。
@@ -43,7 +43,7 @@ D:\Videos\
 ├── merge.bat           启动器，双击运行它
 ├── merge_videos.py     真正干活的脚本（和 merge.bat 放一起）
 ├── lecture-01.mp4      视频（必需）
-├── lecture-01.m4a      音频（可选，也可以是 .aac .mp3 .opus .flac .ogg .wav）
+├── lecture-01.m4a      音频（可选，也可以是 .aac .mp3 .opus .flac .ogg .wav .webm .weba）
 ├── lecture-01.json     字幕（可选，也可以是 .ass .ssa .srt .vtt）
 ├── lecture-01.en.vtt   同一视频的英文字幕——语言后缀可选
 ├── lecture-01.zh-Hans.srt
@@ -130,13 +130,14 @@ PowerShell 不从当前目录运行程序，直接写 `merge.bat` 会报 `Comman
 
 - 源文件不会被原地改写：结果先写临时文件，校验通过再替换。
 - 单个文件失败时，它的源文件分毫不动；退出码为 `1`。
-- 只有校验通过的合并才会删同名附件；`-p` 还会删视频本来就用不上的附件，但合并失败的附件一定保留。
+- 只有校验通过的合并才会删同名附件；`-p` 还会删视频本来就用不上的附件，但合并失败的附件一定保留；`.webm`/`.weba` 侧车不会被 purge 删除，因为它可能是同名视频的另一份下载；合并成功后，如果 `.webm` 里还有视频轨，也会保留该文件。
+- Opus/Vorbis 进 MP4 时会转成 192 kbps AAC，其它编码原样复制；想保留原始编码请输出 `.mkv`。
 - 已经齐全的文件直接跳过，不会重写。
 
 ## 已知限制
 
 - MP4 的字幕存为 `mov_text`（多数 mp4 播放器唯一认的格式）：文字与时间轴保留，字体、位置、特效不保留。MKV 则原样保留字幕编码，PGS/ASS/VobSub 的样式都在。
-- MP4 音频只接受 AAC/MP3/AC3/E-AC3/ALAC；其它编码需要改用 MKV 或先转码。MKV 不限编码。
+- MP4 音频接受 AAC/MP3/AC3/E-AC3/ALAC，并把 Opus/Vorbis 转成 AAC；FLAC 等其它编码需要改用 MKV 或手动转码。MKV 不限编码。
 - 不支持 `.mov`：ffmpeg 的 mov 封装器会静默丢弃 attached_pic 封面，合并会丢封面；请先转成 `.mp4`/`.m4v`/`.mkv`。
 - AVIF 封面需要带 AV1 解码器的 ffmpeg；没有时跳过封面并给出提示，其它轨道照常合并。
 - 路径超过 260 个字符时，旧版 Windows 上 FFmpeg 可能打不开。
