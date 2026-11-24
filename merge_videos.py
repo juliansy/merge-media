@@ -377,6 +377,37 @@ def json_to_srt(source: Path, target: Path) -> int:
     return len(blocks)
 
 
+_SRT_CUE_RE = re.compile(
+    r"^\s*\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{1,3}(?P<rest>.*)$",
+    re.MULTILINE,
+)
+# WebVTT 允许省略小时段（MM:SS.mmm）；SRT 规范要求 HH:MM:SS,mmm，所以两条正则必须分开。
+_VTT_CUE_RE = re.compile(
+    r"^\s*(?:\d{2}:)?\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*(?:\d{2}:)?\d{2}:\d{2}[,.]\d{1,3}(?P<rest>.*)$",
+    re.MULTILINE,
+)
+# 时间轴行末尾的 cue 设置（align:start / position:0% / line:0 ...）不是字幕正文。
+_VTT_SETTING_RE = re.compile(r"^(?:align|line|position|size|region|vertical):\S+$", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
+_ASS_TAG_RE = re.compile(r"\{[^}]*\}")
+
+
+def _cue_pattern(suffix: str) -> "re.Pattern[str]":
+    return _VTT_CUE_RE if suffix.lower() == ".vtt" else _SRT_CUE_RE
+
+
+def _visible_text(value: str) -> str:
+    """去掉 HTML / ASS 覆盖标签与强制换行后，真正会显示出来的文字。"""
+    text = _ASS_TAG_RE.sub("", _HTML_TAG_RE.sub("", value))
+    return text.replace("\\N", " ").replace("\\n", " ").strip()
+
+
+def _cue_text(rest: str) -> str:
+    """时间轴同一行里，时间戳之后的部分；先剔除 cue 设置再判断有没有文字。"""
+    tokens = [token for token in rest.split() if not _VTT_SETTING_RE.match(token)]
+    return _visible_text(" ".join(tokens))
+
+
 def ensure_playable(path: Path, suffix: str) -> None:
     """粗校验字幕文件里确实有可解析的条目。
 
@@ -389,7 +420,7 @@ def ensure_playable(path: Path, suffix: str) -> None:
         raise ValueError(f"字幕无法读取：{exc}") from exc
     suffix = suffix.lower()
     if suffix in (".srt", ".vtt"):
-        if not re.search(r"^\s*\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->", text, re.M):
+        if not _cue_pattern(suffix).search(text):
             raise ValueError("字幕里没有可识别的时间轴（不是有效的 SRT/VTT）")
         if not _has_subtitle_text(text, suffix):
             raise ValueError("字幕里只有时间轴、没有文字")
@@ -407,33 +438,56 @@ def ensure_playable(path: Path, suffix: str) -> None:
 
 
 def _has_subtitle_text(text: str, suffix: str = "") -> bool:
-    """时间轴行、序号行、头部行都不算内容；WebVTT 允许文字写在时间轴同一行。
+    """判断字幕里是否有"会显示出来"的文字。
 
-    ASS/SSA 的 `[Script Info]`、`Format:` 之类也是"非空行"，
-    所以它们的正文只认 Dialogue/Comment 行，其余一律跳过。
+    只认正文：时间轴、序号、cue identifier、NOTE/STYLE/REGION 块、cue 设置都不算；
+    否则"只有时间轴"的空字幕会被当成正常字幕塞进 ffmpeg，产物是一条空轨，
+    而报告会谎称"字幕已并入"。
     """
-    ass_like = suffix.lower() in (".ass", ".ssa")
-    for raw_line in text.replace("\r\n", "\n").split("\n"):
-        line = raw_line.strip()
-        if not line or line.isdigit() or line.upper().startswith("WEBVTT"):
-            continue
-        if ass_like:
-            if not (line.startswith("Dialogue:") or line.startswith("Comment:")):
+    if suffix.lower() in (".ass", ".ssa"):
+        for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = raw_line.strip()
+            if not line.startswith("Dialogue:"):
                 continue
-            # 形如 Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,正文
+            # 形如 Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\an8}正文
             parts = line.split(",", 9)
-            if len(parts) >= 10 and parts[9].strip():
+            if len(parts) >= 10 and _visible_text(parts[9]):
                 return True
+        return False
+
+    vtt = suffix.lower() == ".vtt"
+    cue_re = _cue_pattern(suffix)
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    index = 0
+    while index < len(lines):
+        raw = lines[index]
+        line = raw.strip()
+        if not line:
+            index += 1
             continue
-        if "-->" in line:
-            match = re.match(
-                r"\d{2}:\d{2}:\d{2}[.,]\d{1,3}\s*-->\s*\d{2}:\d{2}:\d{2}[.,]\d{1,3}\s*(.*)$",
-                line,
-            )
-            if match and match.group(1).strip():
+        if vtt and (line.upper().startswith("WEBVTT")
+                    or line.upper().startswith("NOTE")
+                    or line.split()[0].upper() in ("STYLE", "REGION")):
+            # NOTE / STYLE / REGION 是块内容，跳到空行为止。
+            index += 1
+            while index < len(lines) and lines[index].strip():
+                index += 1
+            continue
+        match = cue_re.match(raw)
+        if match is None:
+            index += 1          # 序号、cue identifier、其它注释行，都不算正文
+            continue
+        if _cue_text(match.group("rest") or ""):
+            return True
+        index += 1
+        # 正文可以写在时间轴下面（SRT 与 VTT 都允许），直到空行或下一条时间轴。
+        while index < len(lines):
+            following = lines[index].strip()
+            if not following or cue_re.match(following):
+                break
+            if _visible_text(following):
                 return True
-            continue
-        return True
+            index += 1
     return False
 
 
