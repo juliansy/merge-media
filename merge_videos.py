@@ -3,14 +3,15 @@
 """merge_videos.py -- 批量合并分离的视频、音频、字幕与封面。
 
 扫描目标目录里的视频（.mp4/.m4v/.mkv），用 ffprobe 读出每个视频**已有**的
-音轨 / 字幕轨 / 封面，再在目录里找同名的侧车文件（.m4a/.aac/.mp3、
+音轨 / 字幕轨 / 封面，再在目录里找同名的侧车文件（.m4a/.aac/.mp3/.opus/.flac/.ogg/.wav、
 .ass/.ssa/.srt/.json/.vtt、.jpg/.jpeg/.png/.webp/.avif/.bmp/.gif/.tif/.tiff）。
 只补“视频缺、目录有”的那一部分，一次 ffmpeg 调用完成封装，校验通过后原子替换原视频，
 失败则原样保留所有源文件。最后逐条汇报：哪个视频合并了、补了哪几轨、是否齐全。
 
 容器差异由 CONTAINERS 表集中管理：MP4 家族（.mp4/.m4v）字幕转 mov_text、
-封面写 attached_pic；Matroska（.mkv）字幕原样 copy（PGS/ASS 不转码，MP4 里放不下的
-图像字幕在 MKV 里可以保留），封面写成附件。
+音频只接受 AAC/MP3/AC3/E-AC3/ALAC（其它编码跳过并提示改用 .mkv 或先转码）、
+封面写 attached_pic；Matroska（.mkv）字幕与音频都原样 copy（PGS/ASS/Opus/FLAC 均可），
+封面写成附件。
 不收录 .mov：实测 ffmpeg 的 mov muxer 会静默丢弃 attached_pic 封面（返回 0 但产物
 没有封面流），无法保证“只补缺轨”的承诺，遇到时按不支持的容器报错。
 
@@ -57,7 +58,7 @@ from typing import Callable, Iterable, Iterator, Optional, Sequence
 
 VERSION = "1.5.0"
 
-AUDIO_EXTS = (".m4a", ".aac", ".mp3")
+AUDIO_EXTS = (".m4a", ".aac", ".mp3", ".opus", ".flac", ".ogg", ".wav")
 # 入口白名单 = "ffmpeg 能当文本/图形字幕读出来"的格式；不在这里的后缀一律不发现。
 # .ssa 与 .ass 是同一套解析器，只是文件头版本不同（v4.00 vs v4.00+），必须成对放行。
 SUB_EXTS = (".ass", ".ssa", ".srt", ".json", ".vtt")
@@ -74,6 +75,9 @@ class Container:
     cover_mode:     mp4 把封面当 attached_pic 视频流；matroska 必须写成 -attach 附件，
                     因为 ffmpeg 重新 mux 时会把“视频流形式的封面”降级成普通 1 帧视频轨。
     muxer_args:     只对 mp4/m4v 有意义的封装参数（+faststart）。
+    audio_codecs:   容器能直接 copy 的音频编码；空元组表示不限制（matroska）。
+                    mp4 收 opus/flac/vorbis/pcm 时 muxer 可能不报错，但常见播放器
+                    不认，所以入口按“主流播放器可播”的白名单过滤并在 dry-run 就说明。
     """
 
     suffix: str
@@ -81,13 +85,16 @@ class Container:
     subtitle_codec: str             # "mov_text" | "copy"
     cover_mode: str                 # "video" | "attachment"
     muxer_args: tuple[str, ...]
+    audio_codecs: tuple[str, ...] = ()
 
 
 CONTAINERS: dict[str, Container] = {
     container.suffix: container
     for container in (
-        Container(".mp4", "mp4", "mov_text", "video", ("-movflags", "+faststart")),
-        Container(".m4v", "mp4", "mov_text", "video", ("-movflags", "+faststart")),
+        Container(".mp4", "mp4", "mov_text", "video", ("-movflags", "+faststart"),
+                  ("aac", "mp3", "ac3", "eac3", "alac")),
+        Container(".m4v", "mp4", "mov_text", "video", ("-movflags", "+faststart"),
+                  ("aac", "mp3", "ac3", "eac3", "alac")),
         Container(".mkv", "matroska", "copy", "attachment", ()),
     )
 }
@@ -344,6 +351,25 @@ def probe(tools: Tools, path: Path) -> Probe:
 # --------------------------------------------------------------------------- #
 # 侧车文件发现
 # --------------------------------------------------------------------------- #
+def probe_audio_codec(tools: Tools, path: Path) -> str:
+    """读侧车音频第一条音轨的编码名；文件损坏或没有音轨时抛 ProbeError。"""
+    cmd = [
+        tools.ffprobe, "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name", "-of", "json", str(path),
+    ]
+    proc = run_command(cmd, FFPROBE_TIMEOUT)
+    if proc.returncode != 0:
+        raise ProbeError(one_line(decode(proc.stderr)) or "ffprobe 返回非零")
+    try:
+        streams = json.loads(decode(proc.stdout) or "{}").get("streams") or []
+    except json.JSONDecodeError as exc:
+        raise ProbeError(f"ffprobe 输出不是合法 JSON：{exc}") from exc
+    codec = str(streams[0].get("codec_name") or "") if streams else ""
+    if not codec:
+        raise ProbeError("音频文件里没有可用的音轨")
+    return codec
+
+
 @dataclass(frozen=True)
 class Sidecars:
     audio: Optional[Path] = None
@@ -1033,6 +1059,22 @@ def process_video(ctx: "Context", video: Path) -> Result:
     before = dict(pr.tracks)
     available = sidecar_marks(side)
 
+    # 音频侧车能不能直接 copy 进目标容器，在 plan 阶段就判定（dry-run 也能看见）。
+    audio_problem = ""
+    if plan.add_audio and container.audio_codecs:
+        try:
+            codec = probe_audio_codec(ctx.tools, plan.add_audio)
+        except (ProbeError, ToolError) as exc:
+            audio_problem = f"音频未并入（{brief_error(str(exc), plan.add_audio)}）"
+            plan.add_audio = None
+        else:
+            if codec not in container.audio_codecs:
+                audio_problem = (
+                    f"音频未并入（{codec} 不适合放进 {container.suffix} 容器；"
+                    f"可改用 .mkv，或先把音频转成 AAC/MP3）"
+                )
+                plan.add_audio = None
+
     if plan.skip_reason:
         note = plan.skip_reason
         deleted: list[Path] = []
@@ -1048,7 +1090,7 @@ def process_video(ctx: "Context", video: Path) -> Result:
 
     if ctx.dry_run:
         added = [name for name, path in plan.additions.items() if path]
-        note = "将并入 " + "+".join(added)
+        note = ("将并入 " + "+".join(added)) if added else "没有可并入的内容"
         if plan.dropped_subtitles:
             note += f"；原图形字幕（{'/'.join(sorted(set(plan.dropped_subtitles)))}）无法放入 MP4，将丢弃"
         if plan.add_sub and plan.add_sub.suffix.lower() == ".json":
@@ -1058,6 +1100,8 @@ def process_video(ctx: "Context", video: Path) -> Result:
                 plan.add_sub = None              # 否则“结果”列会声称齐全
                 added = [name for name in added if name != TRACK_SUB]
                 note = f"预演：字幕 JSON 无法读取（{exc}），其余将并入 " + ("+".join(added) or "无")
+        if audio_problem:
+            note += "；" + audio_problem
         missing = [name for name, ok in plan.expected_tracks().items() if not ok and name not in added]
         return Result(video, "planned", before, available, added, missing,
                       time.perf_counter() - started, note)
@@ -1067,6 +1111,8 @@ def process_video(ctx: "Context", video: Path) -> Result:
     dest = video.with_name(f".{video.stem}.mergetmp.{os.getpid()}{container.suffix}")
     temporary: list[Path] = [dest]
     warnings: list[str] = []
+    if audio_problem:
+        warnings.append(audio_problem)
     if plan.dropped_subtitles:
         warnings.append(f"原图形字幕（{'/'.join(sorted(set(plan.dropped_subtitles)))}）无法放入 MP4，已丢弃")
 
@@ -1169,7 +1215,11 @@ def remove_files(ctx: "Context", paths: Iterable[Path]) -> list[Path]:
 
 
 def delete_sources(ctx: "Context", plan: Plan, added: Sequence[str]) -> list[Path]:
-    """删除已并入的侧车；--purge 时再删“视频已有该轨、所以没用上”的那部分。"""
+    """删除已并入的侧车；--purge 时再删“视频已有该轨、所以没用上”的那部分。
+
+    purge 只删“视频本来就有这轨”的侧车：视频缺轨、但侧车因为编码/解析失败没并进去时
+    必须留下，否则用户丢的是唯一一份素材。
+    """
     candidates: list[Path] = []
     for name in added:
         path = plan.additions[name]
@@ -1177,7 +1227,7 @@ def delete_sources(ctx: "Context", plan: Plan, added: Sequence[str]) -> list[Pat
             candidates.append(path)
     if ctx.purge:
         for name, path in plan.side.tracks.items():
-            if path and name not in added:
+            if path and name not in added and plan.probe.tracks[name]:
                 candidates.append(path)
     return remove_files(ctx, candidates)
 
@@ -1465,7 +1515,10 @@ def status_line(result: Result) -> str:
         head = "已合并（" + ("+".join(result.added) or "无新增") + "）"
         return f"{head}{state}，{result.seconds:.1f}s"
     if result.action == "planned":
-        return "预演，将并入 " + ("+".join(result.added) or "无")
+        head = "预演，将并入 " + ("+".join(result.added) or "无")
+        if "；" in result.note:                     # 预演阶段发现的降级原因也要显示
+            return head + "；" + result.note.split("；", 1)[1]
+        return head
     if result.action == "skipped":
         return f"跳过：{result.note}"
     return f"失败：{result.note}"
